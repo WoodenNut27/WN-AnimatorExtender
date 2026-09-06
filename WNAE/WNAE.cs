@@ -3,6 +3,24 @@ using UnityEngine;
 
 namespace WoodenNut.WNAE
 {
+    /// <summary>Parameter Encoder / Decoder が扱うビット列の仕様。</summary>
+    public static class WNAECodec
+    {
+        /// <summary>扱うビット数。VRChat の同期 Int が 8bit なので 8 固定。</summary>
+        public const int BitCount = 8;
+
+        /// <summary>
+        /// Inspector 用のビットラベル。1bit 目を LSB（2^0）、8bit 目を MSB（2^7）とする。
+        /// CmpInt の生成 Bool（`_b0` が LSB）と同じ並びに揃えている。
+        /// </summary>
+        public static string BitLabel(int index)
+        {
+            if (index <= 0) return "Bit 1 (LSB)";
+            if (index >= BitCount - 1) return $"Bit {BitCount} (MSB)";
+            return $"Bit {index + 1}";
+        }
+    }
+
     /// <summary>CmpInt / CmpFloat で共通のビット操作。</summary>
     public static class WNAEUtil
     {

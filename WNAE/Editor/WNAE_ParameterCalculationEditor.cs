@@ -1,265 +1,72 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Linq;
-using System.Reflection;
 using nadena.dev.ndmf.animator;
 using UnityEditor;
 using UnityEditor.Animations;
-using UnityEditor.IMGUI.Controls;
 using UnityEngine;
 using VRC.SDK3.Avatars.Components;
 
 namespace WoodenNut.WNAE
 {
-    #region Expander
+    #region Builder
 
     /// <summary>
-    /// State に付いた <see cref="WNAE_ParameterCalculation"/> を、
-    /// Parameter Driver と遷移条件だけで構成された Sub State Machine へ展開する。
+    /// <see cref="WNAE_ParameterCalculation"/> を、Parameter Driver と遷移条件だけで構成された
+    /// チェーンへ展開する。State の差し替えや遷移の張り替えは
+    /// <see cref="WNAEBehaviourExpander"/> が共通で行う。
     ///
     /// Parameter Driver の Add は定数加算しかできないため、演算の基本形は
-    /// 「入力を上位ビットから崩しながら acc に定数を足し込む」チェーンになる。
+    /// 「入力の最上位の立っているビットを直接消しながら acc に定数を足し込む」
+    /// ディスパッチ（<see cref="WNAEChain.GreedyDispatch"/>）になる。
     /// </summary>
-    internal static class WNAECalcExpander
+    internal class WNAECalcBuilder : IWNAEBehaviourBuilder
     {
-        private const string ParameterPrefix = "WNAE/Calc/";
-        private const float ColumnWidth = 240f;
-        private const float RowHeight = 55f;
+        public static readonly WNAECalcBuilder Instance = new WNAECalcBuilder();
 
-        private struct Target
+        public string DisplayName => "Parameter Calculation";
+        public string ParameterPrefix => "WNAE/Calc/";
+        public string SubStateMachinePrefix => "WNAE Calc/";
+
+        public bool Matches(StateMachineBehaviour behaviour) => behaviour is WNAE_ParameterCalculation;
+
+        public List<WNAEIssue> Validate(StateMachineBehaviour behaviour)
         {
-            public VirtualStateMachine Parent;
-            public VirtualState State;
-            public Vector3 Position;
-            public List<WNAE_ParameterCalculation> Calculations;
+            return Validate((WNAE_ParameterCalculation)behaviour);
         }
 
-        public static void Expand(VirtualControllerContext controllerContext)
+        public void Prepare(
+            VirtualAnimatorController controller, WNAEChainContext ctx, StateMachineBehaviour behaviour)
         {
-            var index = 0;
+            var calculation = (WNAE_ParameterCalculation)behaviour;
+            var operation = calculation.operation;
+            var usesB = WNAECalc.UsesB(operation);
 
-            foreach (var controller in controllerContext.Controllers.Values.ToList())
+            ctx.BitWidth = Mathf.Clamp(
+                calculation.bitWidth, WNAECalc.MinBitWidth, WNAECalc.MaxBitWidth);
+
+            WNAEBehaviourExpander.DeclareParameter(
+                controller, calculation.parameterA, AnimatorControllerParameterType.Int, DisplayName);
+            if (usesB)
             {
-                if (controller == null) continue;
-
-                VirtualClip clip = null;
-
-                foreach (var layer in controller.Layers.ToList())
-                {
-                    var root = layer.StateMachine;
-                    if (root == null) continue;
-
-                    // 遷移の張り替えでレイヤー全体を歩くため、先に対象を集めてから処理する
-                    var targets = new List<Target>();
-                    Collect(controller, root, targets);
-
-                    foreach (var target in targets)
-                    {
-                        clip = clip ?? VirtualClip.Create("WNAE Calc Empty");
-                        ExpandState(controllerContext, controller, root, target, clip, ref index);
-                    }
-                }
+                WNAEBehaviourExpander.DeclareParameter(
+                    controller, calculation.parameterB, AnimatorControllerParameterType.Int, DisplayName);
             }
-        }
+            WNAEBehaviourExpander.DeclareParameter(
+                controller, calculation.parameterC, AnimatorControllerParameterType.Int, DisplayName);
 
-        private static void Collect(
-            VirtualAnimatorController controller, VirtualStateMachine stateMachine, List<Target> targets)
-        {
-            if (stateMachine == null) return;
-
-            foreach (var child in stateMachine.StateMachines.ToList())
-            {
-                Collect(controller, child.StateMachine, targets);
-            }
-
-            foreach (var child in stateMachine.States.ToList())
-            {
-                var state = child.State;
-                if (state == null) continue;
-
-                var calculations = state.Behaviours.OfType<WNAE_ParameterCalculation>().ToList();
-                if (calculations.Count == 0) continue;
-
-                var label = $"{controller.Name} / {state.Name}";
-
-                // SMB はユーザーのコントローラアセットの実体なので、リストから外すだけにする
-                state.Behaviours = state.Behaviours.RemoveAll(b => b is WNAE_ParameterCalculation);
-
-                if (state.Motion != null || !state.Behaviours.IsEmpty)
-                {
-                    UnityEngine.Debug.LogWarning(
-                        $"[WNAE] Parameter Calculation ({label}): この State は演算用の Sub State Machine に" +
-                        "置き換えられるため、Motion と他の Behaviour は失われます。");
-                }
-
-                var accepted = new List<WNAE_ParameterCalculation>();
-                foreach (var calculation in calculations)
-                {
-                    var issues = Validate(calculation);
-
-                    foreach (var issue in issues)
-                    {
-                        var message = $"[WNAE] Parameter Calculation ({label}): {issue.Message}";
-                        if (issue.Level == WNAEIssueLevel.Error) UnityEngine.Debug.LogError(message);
-                        else if (issue.Level == WNAEIssueLevel.Warning) UnityEngine.Debug.LogWarning(message);
-                        else UnityEngine.Debug.Log(message);
-                    }
-
-                    if (issues.Any(i => i.Level == WNAEIssueLevel.Error)) continue;
-                    accepted.Add(calculation);
-                }
-
-                if (accepted.Count == 0) continue;
-
-                targets.Add(new Target
-                {
-                    Parent = stateMachine,
-                    State = state,
-                    Position = child.Position,
-                    Calculations = accepted,
-                });
-            }
-        }
-
-        /// <summary>元の State を、演算チェーンを収めた Sub State Machine で置き換える。</summary>
-        private static void ExpandState(
-            VirtualControllerContext controllerContext,
-            VirtualAnimatorController controller,
-            VirtualStateMachine layerRoot,
-            Target target,
-            VirtualClip clip,
-            ref int index)
-        {
-            var parent = target.Parent;
-            var state = target.State;
-
-            var sub = VirtualStateMachine.Create(controllerContext.CloneContext, "WNAE Calc/" + state.Name);
-
-            parent.StateMachines = parent.StateMachines.Add(new VirtualStateMachine.VirtualChildStateMachine
-            {
-                StateMachine = sub,
-                Position = target.Position,
-            });
-
-            var terminals = new List<VirtualState>();
-            VirtualState head = null;
-
-            foreach (var calculation in target.Calculations)
-            {
-                var ctx = new CalcContext
-                {
-                    StateMachine = sub,
-                    Clip = clip,
-                    WriteDefaults = state.WriteDefaultValues,
-                    Prefix = ParameterPrefix + index++,
-                    Calculation = calculation,
-                };
-
-                DeclareParameters(controller, ctx);
-
-                var entry = Build(ctx);
-
-                if (head == null)
-                {
-                    head = entry.First;
-                    sub.DefaultState = head;
-                }
-                else
-                {
-                    // 直前の演算の終端から、この演算の先頭へ繋ぐ
-                    Link(terminals, entry.First, null);
-                }
-
-                terminals = entry.Terminals;
-            }
-
-            if (head == null) return;
-
-            // 出ていく遷移は終端へ移す。自己遷移が含まれていても、この後の張り替えで先頭に向く
-            var outgoing = state.Transitions;
-            state.Transitions = ImmutableList<VirtualStateTransition>.Empty;
-
-            foreach (var terminal in terminals)
-            {
-                terminal.Transitions = outgoing;
-            }
-
-            // 元の State を指していた遷移をすべて先頭 State へ向ける。
-            // Sub State Machine 自体ではなく中の State を直接指すことで、
-            // AnyState から Sub State Machine を指せるかという不確実性を避けている。
-            Repoint(layerRoot, state, head);
-
-            if (parent.DefaultState == state)
-            {
-                // Default State は Sub State Machine 内の State を指せないため、Entry から入れる
-                var entryTransition = VirtualTransition.Create();
-                entryTransition.SetDestination(sub);
-                parent.EntryTransitions = parent.EntryTransitions.Insert(0, entryTransition);
-
-                parent.DefaultState = parent.States
-                    .Select(cs => cs.State)
-                    .FirstOrDefault(s => s != null && s != state);
-            }
-
-            parent.States = parent.States.RemoveAll(cs => cs.State == state);
-        }
-
-        private static void Repoint(VirtualStateMachine stateMachine, VirtualState from, VirtualState to)
-        {
-            if (stateMachine == null) return;
-
-            foreach (var transition in stateMachine.AnyStateTransitions) Retarget(transition, from, to);
-            foreach (var transition in stateMachine.EntryTransitions) Retarget(transition, from, to);
-
-            foreach (var pair in stateMachine.StateMachineTransitions)
-            {
-                foreach (var transition in pair.Value) Retarget(transition, from, to);
-            }
-
-            foreach (var child in stateMachine.States)
-            {
-                if (child.State == null) continue;
-                foreach (var transition in child.State.Transitions) Retarget(transition, from, to);
-            }
-
-            foreach (var child in stateMachine.StateMachines) Repoint(child.StateMachine, from, to);
-        }
-
-        private static void Retarget(VirtualTransitionBase transition, VirtualState from, VirtualState to)
-        {
-            if (transition.DestinationState == from) transition.SetDestination(to);
-        }
-
-        private static void DeclareParameters(VirtualAnimatorController controller, CalcContext ctx)
-        {
-            var calculation = ctx.Calculation;
-            var usesB = WNAECalc.UsesB(calculation.operation);
-
-            DeclareOperand(controller, calculation.parameterA);
-            if (usesB) DeclareOperand(controller, calculation.parameterB);
-            DeclareOperand(controller, calculation.parameterC);
-
-            // 中間パラメータは同期不要なので VRCExpressionParameters には追加しない
-            WNAEAnimator.EnsureIntParameter(controller, ctx.Ta);
+            // 中間パラメータは同期不要なので VRCExpressionParameters には追加しない。
+            // 演算ごとに使うものだけ宣言する（Add / Sub は a を直接 acc に置くので ta 不要）
+            var usesTa = operation != WNAECalcOperation.Add && operation != WNAECalcOperation.Sub;
+            if (usesTa) WNAEAnimator.EnsureIntParameter(controller, ctx.Ta);
             if (usesB) WNAEAnimator.EnsureIntParameter(controller, ctx.Tb);
             WNAEAnimator.EnsureIntParameter(controller, ctx.Acc);
+            if (operation == WNAECalcOperation.Mul) WNAEAnimator.EnsureIntParameter(controller, ctx.T2);
         }
 
-        private static void DeclareOperand(VirtualAnimatorController controller, string name)
+        public WNAEBuildResult Build(WNAEChainContext ctx, StateMachineBehaviour behaviour)
         {
-            if (controller.Parameters.TryGetValue(name, out var existing))
-            {
-                if (existing.type != AnimatorControllerParameterType.Int)
-                {
-                    UnityEngine.Debug.LogWarning(
-                        $"[WNAE] Parameter Calculation: \"{name}\" は {existing.type} 型です。" +
-                        "Int として扱われるため、値が意図せず変換される可能性があります。");
-                }
-                return;
-            }
-
-            WNAEAnimator.EnsureIntParameter(controller, name);
+            return Build(ctx, (WNAE_ParameterCalculation)behaviour);
         }
 
         #region Validation
@@ -310,18 +117,14 @@ namespace WoodenNut.WNAE
 
             switch (calculation.operation)
             {
-                // Init + Store
-                case WNAECalcOperation.Copy:
-                    return 2;
-
-                // Init + acc=a + 2n + 桁あふれ補正 2 + Store
+                // Init + 展開 n + 桁あふれ補正 2 + Store
                 case WNAECalcOperation.Add:
                 case WNAECalcOperation.Sub:
-                    return 2 * n + 5;
+                    return n + 4;
 
-                // Init + 2n + Store
+                // Init + 展開 n + Store
                 case WNAECalcOperation.Not:
-                    return 2 * n + 2;
+                    return n + 2;
 
                 // Init + 4n + Store
                 case WNAECalcOperation.And:
@@ -330,19 +133,36 @@ namespace WoodenNut.WNAE
                 case WNAECalcOperation.Xnor:
                     return 4 * n + 2;
 
-                // Init + 分岐 2^n + 受け皿 + 上位ビット落とし 2n + Store
+                // Init + 上位分岐 + 下位分岐 + 下位積の合算 + 合流 + 桁落とし n + Store
                 case WNAECalcOperation.Mul:
-                    return values + 2 * n + 3;
+                {
+                    var low = n / 2;
+                    var high = n - low;
+                    var subSize = 1 << low;
 
-                // Init + 分岐 n + 受け皿 + 上位ビット落とし 2(n-1) + Store
+                    var count = (1 << high) - 1 + subSize + n + 3;
+                    if (subSize >= 2) count += FloorLog2((long)(values - 1) * (subSize - 1)) + 1;
+                    return count;
+                }
+
+                // Init + 分岐 n + 受け皿 + 桁落とし (n-1) + Store
                 case WNAECalcOperation.ShiftLeft:
-                    return n <= 1 ? n + 3 : 3 * n + 1;
+                    return n >= 2 ? 2 * n + 2 : 4;
 
-                // Init + Σ(分岐 + 2(n-s)) + 受け皿 + Store
+                // Init + Σ(分岐 + 展開 n-s) + 受け皿 + Store
                 case WNAECalcOperation.ShiftRight:
-                    return n * n + 2 * n + 3;
+                    return n * (n + 1) / 2 + n + 3;
 
-                // Init + Σ(分岐 + 2(top+1)) + ゼロ除算 + Store
+                // Init + 剰余化 + 分岐 n + 分岐ごとに展開 n + 受け皿 + Store
+                case WNAECalcOperation.RotateLeft:
+                case WNAECalcOperation.RotateRight:
+                {
+                    var reduceHi = 0;
+                    while ((long)n << (reduceHi + 1) <= values - 1) reduceHi++;
+                    return n * n + n + reduceHi + 4;
+                }
+
+                // Init + 分岐 + 分岐ごとに商の展開 + ゼロ除算 + Store
                 case WNAECalcOperation.Div:
                 case WNAECalcOperation.Mod:
                 {
@@ -353,7 +173,7 @@ namespace WoodenNut.WNAE
                         while ((long)b << (top + 1) <= values - 1) top++;
                         levels += top + 1;
                     }
-                    return values + 2 * levels + 2;
+                    return values + levels + 2;
                 }
 
                 default:
@@ -361,255 +181,210 @@ namespace WoodenNut.WNAE
             }
         }
 
+        private static int FloorLog2(long value)
+        {
+            var result = 0;
+            while (value >= 2)
+            {
+                value >>= 1;
+                result++;
+            }
+            return result;
+        }
+
         #endregion
 
         #region Chain construction
 
-        private class CalcContext
+        private static WNAEBuildResult Build(WNAEChainContext ctx, WNAE_ParameterCalculation calculation)
         {
-            public VirtualStateMachine StateMachine;
-            public VirtualClip Clip;
-            public bool WriteDefaults;
-            public string Prefix;
-            public WNAE_ParameterCalculation Calculation;
+            var init = ctx.NewState("Init", 0, d => FillInit(d, ctx, calculation));
+            var entry = new List<VirtualState> { init };
 
-            public int Column;
-
-            public string Ta => Prefix + "/ta";
-            public string Tb => Prefix + "/tb";
-            public string Acc => Prefix + "/acc";
-
-            public int BitWidth => Mathf.Clamp(
-                Calculation.bitWidth, WNAECalc.MinBitWidth, WNAECalc.MaxBitWidth);
-
-            public int Modulus => 1 << BitWidth;
-
-            public VirtualState NewState(string label, int row, Action<VRCAvatarParameterDriver> fill)
-            {
-                var state = StateMachine.AddState(
-                    label, Clip, new Vector3(Column * ColumnWidth, row * RowHeight, 0f));
-                state.WriteDefaultValues = WriteDefaults;
-
-                if (fill == null) return state;
-
-                var driver = WNAEAnimator.CreateDriver("WNAE Calc " + label, localOnly: false);
-                fill(driver);
-                if (driver.parameters.Count > 0) state.Behaviours = state.Behaviours.Add(driver);
-
-                return state;
-            }
-        }
-
-        private struct BuildResult
-        {
-            public VirtualState First;
-            public List<VirtualState> Terminals;
-        }
-
-        private static void Link(
-            IEnumerable<VirtualState> from, VirtualState to, IEnumerable<AnimatorCondition> conditions)
-        {
-            foreach (var state in from)
-            {
-                state.Transitions = state.Transitions.Add(WNAEAnimator.CreateTransition(to, conditions));
-            }
-        }
-
-        /// <summary>
-        /// parameter が [min, max] の外だったときの受け皿へ繋ぐ。
-        /// Animator の条件は AND のみなので、下限割れと上限超えを 2 本の遷移に分けて表現する。
-        /// </summary>
-        private static void LinkOutOfRange(
-            IEnumerable<VirtualState> from, VirtualState to, string parameter, int min, int max)
-        {
-            var states = from as IList<VirtualState> ?? from.ToList();
-
-            Link(states, to, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, parameter, min) });
-            Link(states, to, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, parameter, max) });
-        }
-
-        private static AnimatorCondition BitSet(string parameter, int bit)
-        {
-            return WNAEAnimator.Condition(AnimatorConditionMode.Greater, parameter, bit - 1);
-        }
-
-        private static AnimatorCondition BitClear(string parameter, int bit)
-        {
-            return WNAEAnimator.Condition(AnimatorConditionMode.Less, parameter, bit);
-        }
-
-        /// <summary>
-        /// src の bit k を判定する 2 分岐を 1 段追加する。
-        /// 両側に明示的な条件を付けるため、遷移の並び順に依存せず、どちらも即座に成立する。
-        /// </summary>
-        private static List<VirtualState> BitLevel(
-            CalcContext ctx,
-            List<VirtualState> previous,
-            string source,
-            int k,
-            int row,
-            Action<VRCAvatarParameterDriver> onSet,
-            Action<VRCAvatarParameterDriver> onClear)
-        {
-            ctx.Column++;
-
-            var bit = 1 << k;
-            var set = ctx.NewState($"b{k}=1", row, onSet);
-            var clear = ctx.NewState($"b{k}=0", row + 1, onClear);
-
-            Link(previous, set, new[] { BitSet(source, bit) });
-            Link(previous, clear, new[] { BitClear(source, bit) });
-
-            return new List<VirtualState> { set, clear };
-        }
-
-        /// <summary>acc の上位ビットを落として mod 2^BitWidth にそろえる。</summary>
-        private static List<VirtualState> StripHighBits(
-            CalcContext ctx, List<VirtualState> previous, int fromBit, int toBit)
-        {
-            var current = previous;
-
-            for (var k = fromBit; k >= toBit; k--)
-            {
-                var bit = 1 << k;
-                current = BitLevel(ctx, current, ctx.Acc, k, 0,
-                    d => WNAEAnimator.AddAdd(d, ctx.Acc, -bit),
-                    null);
-            }
-
-            return current;
-        }
-
-        private static BuildResult Build(CalcContext ctx)
-        {
-            var calculation = ctx.Calculation;
-
-            var init = ctx.NewState("Init", 0, d =>
-            {
-                WNAEAnimator.AddCopy(d, ctx.Ta, calculation.parameterA);
-                if (WNAECalc.UsesB(calculation.operation))
-                {
-                    WNAEAnimator.AddCopy(d, ctx.Tb, calculation.parameterB);
-                }
-                WNAEAnimator.AddSet(d, ctx.Acc, 0f);
-            });
-
-            var current = new List<VirtualState> { init };
-
+            VirtualState store;
             switch (calculation.operation)
             {
-                // Copy は Init が ta へ写した値をそのまま Store が書き出すため、チェーンを持たない
-                case WNAECalcOperation.Copy:
-                    break;
-
                 case WNAECalcOperation.Add:
-                    current = BuildAddSub(ctx, current, subtract: false);
+                    store = BuildAddSub(ctx, entry, calculation, subtract: false);
                     break;
                 case WNAECalcOperation.Sub:
-                    current = BuildAddSub(ctx, current, subtract: true);
+                    store = BuildAddSub(ctx, entry, calculation, subtract: true);
                     break;
                 case WNAECalcOperation.Not:
-                    current = BuildNot(ctx, current);
+                    store = BuildNot(ctx, entry, calculation);
                     break;
                 case WNAECalcOperation.And:
                 case WNAECalcOperation.Or:
                 case WNAECalcOperation.Xor:
                 case WNAECalcOperation.Xnor:
-                    current = BuildBitwise(ctx, current, calculation.operation);
+                    store = BuildBitwise(ctx, entry, calculation);
                     break;
                 case WNAECalcOperation.Mul:
-                    current = BuildMul(ctx, current);
+                    store = BuildMul(ctx, entry, calculation);
                     break;
                 case WNAECalcOperation.ShiftLeft:
-                    current = BuildShiftLeft(ctx, current);
+                    store = BuildShiftLeft(ctx, entry, calculation);
                     break;
                 case WNAECalcOperation.ShiftRight:
-                    current = BuildShiftRight(ctx, current);
+                    store = BuildShiftRight(ctx, entry, calculation);
                     break;
-                case WNAECalcOperation.Div:
-                case WNAECalcOperation.Mod:
-                    current = BuildDivMod(ctx, current, calculation.operation == WNAECalcOperation.Mod);
+                case WNAECalcOperation.RotateLeft:
+                    store = BuildRotate(ctx, entry, calculation, right: false);
+                    break;
+                case WNAECalcOperation.RotateRight:
+                    store = BuildRotate(ctx, entry, calculation, right: true);
+                    break;
+                default:
+                    store = BuildDivMod(ctx, entry, calculation,
+                        modulo: calculation.operation == WNAECalcOperation.Mod);
                     break;
             }
 
-            // Mod は商ではなく剰余、Copy はチェーンを持たないので、どちらも ta が答え
-            var source =
-                calculation.operation == WNAECalcOperation.Mod ||
-                calculation.operation == WNAECalcOperation.Copy
-                    ? ctx.Ta
-                    : ctx.Acc;
-
-            ctx.Column++;
-            var final = ctx.NewState("Store", 0,
-                d => WNAEAnimator.AddCopy(d, calculation.parameterC, source));
-            Link(current, final, null);
-
-            return new BuildResult { First = init, Terminals = new List<VirtualState> { final } };
+            return new WNAEBuildResult { First = init, Last = store };
         }
 
-        /// <summary>c = a ± b。tb を上位ビットから崩しながら acc に定数を足し引きする。</summary>
-        private static List<VirtualState> BuildAddSub(
-            CalcContext ctx, List<VirtualState> current, bool subtract)
+        private static void FillInit(
+            VRCAvatarParameterDriver d, WNAEChainContext ctx, WNAE_ParameterCalculation calculation)
         {
-            var modulus = ctx.Modulus;
+            switch (calculation.operation)
+            {
+                case WNAECalcOperation.Add:
+                case WNAECalcOperation.Sub:
+                    // a は最初から acc に置く。ta は使わない
+                    WNAEAnimator.AddCopy(d, ctx.Acc, calculation.parameterA);
+                    WNAEAnimator.AddCopy(d, ctx.Tb, calculation.parameterB);
+                    break;
+
+                case WNAECalcOperation.Not:
+                    // c = (2^N - 1) - a。全ビットの立った値から a の立っているビットを引いていく
+                    WNAEAnimator.AddCopy(d, ctx.Ta, calculation.parameterA);
+                    WNAEAnimator.AddSet(d, ctx.Acc, ctx.Modulus - 1);
+                    break;
+
+                case WNAECalcOperation.Mul:
+                    WNAEAnimator.AddCopy(d, ctx.Ta, calculation.parameterA);
+                    WNAEAnimator.AddCopy(d, ctx.Tb, calculation.parameterB);
+                    WNAEAnimator.AddSet(d, ctx.Acc, 0f);
+                    WNAEAnimator.AddSet(d, ctx.T2, 0f);
+                    break;
+
+                default:
+                    WNAEAnimator.AddCopy(d, ctx.Ta, calculation.parameterA);
+                    WNAEAnimator.AddCopy(d, ctx.Tb, calculation.parameterB);
+                    WNAEAnimator.AddSet(d, ctx.Acc, 0f);
+                    break;
+            }
+        }
+
+        /// <summary>結果を c へ書き出す終端。Mod だけは商ではなく剰余（ta）が答え。</summary>
+        private static VirtualState NewStore(WNAEChainContext ctx, WNAE_ParameterCalculation calculation)
+        {
+            var source = calculation.operation == WNAECalcOperation.Mod ? ctx.Ta : ctx.Acc;
 
             ctx.Column++;
-            var seed = ctx.NewState("acc=a", 0, d => WNAEAnimator.AddCopy(d, ctx.Acc, ctx.Ta));
-            Link(current, seed, null);
-            current = new List<VirtualState> { seed };
+            return ctx.NewState("Store", 0,
+                d => WNAEAnimator.AddCopy(d, calculation.parameterC, source));
+        }
 
-            for (var k = ctx.BitWidth - 1; k >= 0; k--)
-            {
-                var bit = 1 << k;
-                current = BitLevel(ctx, current, ctx.Tb, k, 0,
-                    d =>
+        /// <summary>c = a ± b。tb の立っているビットを直接消しながら acc に足し引きする。</summary>
+        private static VirtualState BuildAddSub(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation,
+            bool subtract)
+        {
+            var n = ctx.BitWidth;
+            var modulus = ctx.Modulus;
+
+            var sources = WNAEChain.GreedyDispatch(ctx, entry, ctx.Tb, n - 1, 0, 0,
+                k => 1L << k,
+                k => $"b{k}",
+                k =>
+                {
+                    var bit = 1 << k;
+                    return (Action<VRCAvatarParameterDriver>)(d =>
                     {
                         WNAEAnimator.AddAdd(d, ctx.Tb, -bit);
                         WNAEAnimator.AddAdd(d, ctx.Acc, subtract ? -bit : bit);
-                    },
-                    null);
-            }
+                    });
+                });
 
-            // 桁あふれ / 桁借りの補正
+            // 桁あふれ / 桁借りの補正。tb を消し切ったこと（tb < 1）を条件に含める
             ctx.Column++;
+            var done = WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Tb, 1);
+            VirtualState wrap;
+            var keep = default(VirtualState);
+
             if (subtract)
             {
-                var wrap = ctx.NewState("wrap+", 0, d => WNAEAnimator.AddAdd(d, ctx.Acc, modulus));
-                var keep = ctx.NewState("keep", 1, null);
-                Link(current, wrap, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, 0) });
-                Link(current, keep, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, -1) });
-                return new List<VirtualState> { wrap, keep };
+                wrap = ctx.NewState("wrap+", 0, d => WNAEAnimator.AddAdd(d, ctx.Acc, modulus));
+                keep = ctx.NewState("keep", 1, null);
+                WNAEChain.Link(sources, wrap,
+                    new[] { done, WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, 0) });
+                WNAEChain.Link(sources, keep,
+                    new[] { done, WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, -1) });
             }
             else
             {
-                var wrap = ctx.NewState("wrap-", 0, d => WNAEAnimator.AddAdd(d, ctx.Acc, -modulus));
-                var keep = ctx.NewState("keep", 1, null);
-                Link(current, wrap,
-                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, modulus - 1) });
-                Link(current, keep,
-                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, modulus) });
-                return new List<VirtualState> { wrap, keep };
-            }
-        }
-
-        /// <summary>c = ~a。ta を崩し、立っていなかったビットを acc に足す。</summary>
-        private static List<VirtualState> BuildNot(CalcContext ctx, List<VirtualState> current)
-        {
-            for (var k = ctx.BitWidth - 1; k >= 0; k--)
-            {
-                var bit = 1 << k;
-                current = BitLevel(ctx, current, ctx.Ta, k, 0,
-                    d => WNAEAnimator.AddAdd(d, ctx.Ta, -bit),
-                    d => WNAEAnimator.AddAdd(d, ctx.Acc, bit));
+                wrap = ctx.NewState("wrap-", 0, d => WNAEAnimator.AddAdd(d, ctx.Acc, -modulus));
+                keep = ctx.NewState("keep", 1, null);
+                WNAEChain.Link(sources, wrap,
+                    new[] { done, WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, modulus - 1) });
+                WNAEChain.Link(sources, keep,
+                    new[] { done, WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, modulus) });
             }
 
-            return current;
+            // b が値域外でも行き場が無くならないようにだけする（結果は保証しない）
+            WNAEChain.Link(entry, keep,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Tb, modulus - 1) });
+
+            var store = NewStore(ctx, calculation);
+            WNAEChain.Link(new[] { wrap, keep }, store, null);
+            return store;
         }
 
-        /// <summary>ta と tb を同時に崩し、ビットごとの論理演算結果を acc へ積む。</summary>
-        private static List<VirtualState> BuildBitwise(
-            CalcContext ctx, List<VirtualState> current, WNAECalcOperation operation)
+        /// <summary>c = ~a。acc = 2^N - 1 から、a の立っているビットを引いていく。</summary>
+        private static VirtualState BuildNot(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation)
         {
+            var n = ctx.BitWidth;
+            var modulus = ctx.Modulus;
+
+            var sources = WNAEChain.GreedyDispatch(ctx, entry, ctx.Ta, n - 1, 0, 0,
+                k => 1L << k,
+                k => $"b{k}",
+                k =>
+                {
+                    var bit = 1 << k;
+                    return (Action<VRCAvatarParameterDriver>)(d =>
+                    {
+                        WNAEAnimator.AddAdd(d, ctx.Ta, -bit);
+                        WNAEAnimator.AddAdd(d, ctx.Acc, -bit);
+                    });
+                });
+
+            var store = NewStore(ctx, calculation);
+            WNAEChain.Link(sources, store,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Ta, 1) });
+
+            // a が値域外でも行き場が無くならないようにだけする
+            WNAEChain.Link(entry, store,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Ta, modulus - 1) });
+
+            return store;
+        }
+
+        /// <summary>
+        /// ta と tb を同時に崩し、ビットごとの論理演算結果を acc へ積む。
+        ///
+        /// 2 つの値の「どちらかにビットが立っている最上位」は範囲条件 2 つでは表せないため、
+        /// ここだけは全レベルを順に通る 4 分岐（(a,b) の全組み合わせ）のままにしている。
+        /// レベルを飛ばす形にすると State は 3n+2 に減るが、遷移が約 2 倍以上に膨らむ。
+        /// </summary>
+        private static VirtualState BuildBitwise(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation)
+        {
+            var operation = calculation.operation;
+            var current = entry;
+
             for (var k = ctx.BitWidth - 1; k >= 0; k--)
             {
                 var bit = 1 << k;
@@ -617,7 +392,7 @@ namespace WoodenNut.WNAE
 
                 var next = new List<VirtualState>();
 
-                // (a, b) の 4 通り。最後の (0,0) を条件なしの受け皿にする
+                // (a, b) の 4 通り
                 var cases = new[]
                 {
                     new { A = true, B = true, Row = 0 },
@@ -639,10 +414,10 @@ namespace WoodenNut.WNAE
                         if (result) WNAEAnimator.AddAdd(d, ctx.Acc, bit);
                     });
 
-                    Link(current, state, new[]
+                    WNAEChain.Link(current, state, new[]
                     {
-                        aBit ? BitSet(ctx.Ta, bit) : BitClear(ctx.Ta, bit),
-                        bBit ? BitSet(ctx.Tb, bit) : BitClear(ctx.Tb, bit),
+                        aBit ? WNAEChain.BitSet(ctx.Ta, bit) : WNAEChain.BitClear(ctx.Ta, bit),
+                        bBit ? WNAEChain.BitSet(ctx.Tb, bit) : WNAEChain.BitClear(ctx.Tb, bit),
                     });
                     next.Add(state);
                 }
@@ -650,7 +425,9 @@ namespace WoodenNut.WNAE
                 current = next;
             }
 
-            return current;
+            var store = NewStore(ctx, calculation);
+            WNAEChain.Link(current, store, null);
+            return store;
         }
 
         private static bool Apply(WNAECalcOperation operation, bool a, bool b)
@@ -666,41 +443,133 @@ namespace WoodenNut.WNAE
         }
 
         /// <summary>
-        /// c = a * b。tb の値ごとに分岐し、各分岐では定数倍（Convert Range）で一気に求める。
-        /// 定数倍は除算を含まないため結果が厳密な整数になり、Int への丸め規則に依存しない。
+        /// c = a * b。b を上位 / 下位の 2 ブロックに割り、それぞれ定数倍（Convert Range）で
+        /// 部分積を作ってから足し合わせる。全値分岐（2^N 個）に比べ State 数が桁違いに少ない。
+        ///
+        /// Convert Range の変換元は 0〜2^N にしている。2 の冪なので除算が浮動小数点でも厳密で、
+        /// 入力が変換元範囲に収まるため、クランプの有無にかかわらず結果が変わらない。
+        /// 変換先は 0〜2^N×定数の整数傾きなので、結果も厳密な整数になる。
         /// </summary>
-        private static List<VirtualState> BuildMul(CalcContext ctx, List<VirtualState> current)
+        private static VirtualState BuildMul(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation)
         {
+            var n = ctx.BitWidth;
             var modulus = ctx.Modulus;
+            var low = n / 2;
+            var high = n - low;
+            var subSize = 1 << low;
 
+            // 上位ブロック: tb ∈ [m×S, (m+1)×S) で分岐し、acc = a × (m×S) を作る。
+            // m = 0 は掛ける定数が 0（acc は Init の 0 のまま）なので分岐を作らない
             ctx.Column++;
-            var branches = new List<VirtualState>();
+            var lowEntry = new List<VirtualState>(entry);
 
-            for (var b = 0; b < modulus; b++)
+            for (var m = 1; m < 1 << high; m++)
             {
-                var value = b;
-                var state = ctx.NewState($"b={value}", value, value == 0
-                    ? (Action<VRCAvatarParameterDriver>)null
-                    : d => WNAEAnimator.AddCopyRange(d, ctx.Acc, ctx.Ta, 0f, 1f, 0f, value));
+                var scaled = m * subSize;
+                var state = ctx.NewState($"acc=a×{scaled}", m - 1, d =>
+                {
+                    WNAEAnimator.AddCopyRange(
+                        d, ctx.Acc, ctx.Ta, 0f, modulus, 0f, (float)modulus * scaled);
+                    WNAEAnimator.AddAdd(d, ctx.Tb, -scaled);
+                });
 
-                Link(current, state,
-                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, value) });
-                branches.Add(state);
+                WNAEChain.Link(entry, state, new[]
+                {
+                    WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Tb, scaled - 1),
+                    WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Tb, scaled + subSize),
+                });
+                lowEntry.Add(state);
             }
 
-            // tb が値域外だった場合の受け皿（acc は Init で 0 になっている）
-            var fallback = ctx.NewState("b=out", modulus, null);
-            LinkOutOfRange(current, fallback, ctx.Tb, 0, modulus - 1);
-            branches.Add(fallback);
+            // 下位ブロック: 残った tb = l で分岐し、t2 = a × l を作る
+            ctx.Column++;
+            var addEntry = new List<VirtualState>();
 
-            // 積は最大 (2^N-1)^2 なので、bit 2N-1 … N を落として mod 2^N にする
-            return StripHighBits(ctx, branches, 2 * ctx.BitWidth - 1, ctx.BitWidth);
+            for (var l = 0; l < subSize; l++)
+            {
+                var factor = l;
+                var state = ctx.NewState($"t2=a×{factor}", factor, factor == 0
+                    ? (Action<VRCAvatarParameterDriver>)null
+                    : d => WNAEAnimator.AddCopyRange(
+                        d, ctx.T2, ctx.Ta, 0f, modulus, 0f, (float)modulus * factor));
+
+                WNAEChain.Link(lowEntry, state,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, factor) });
+                addEntry.Add(state);
+            }
+
+            // 下位の積 t2 を acc に足し込む
+            var sources = addEntry;
+            var t2Hi = 0;
+
+            if (subSize >= 2)
+            {
+                t2Hi = FloorLog2((long)(modulus - 1) * (subSize - 1));
+
+                sources = WNAEChain.GreedyDispatch(ctx, addEntry, ctx.T2, t2Hi, 0, 0,
+                    k => 1L << k,
+                    k => $"t2:b{k}",
+                    k =>
+                    {
+                        var bit = 1 << k;
+                        return (Action<VRCAvatarParameterDriver>)(d =>
+                        {
+                            WNAEAnimator.AddAdd(d, ctx.T2, -bit);
+                            WNAEAnimator.AddAdd(d, ctx.Acc, bit);
+                        });
+                    });
+            }
+
+            // 合流点。t2 を足し切ってから桁落としへ進む
+            ctx.Column++;
+            var join = ctx.NewState("join", 0, null);
+            WNAEChain.Link(sources, join,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.T2, 1) });
+
+            if (subSize >= 2)
+            {
+                // a が値域外だった場合の受け皿
+                WNAEChain.Link(addEntry, join, new[]
+                {
+                    WNAEAnimator.Condition(
+                        AnimatorConditionMode.Greater, ctx.T2, (1L << (t2Hi + 1)) - 1),
+                });
+            }
+
+            // 積は最大 (2^N-1)² なので、acc の bit 2N-1 … N を落として mod 2^N にする
+            var stripSources = WNAEChain.GreedyDispatch(
+                ctx, new List<VirtualState> { join }, ctx.Acc, 2 * n - 1, n, 0,
+                k => 1L << k,
+                k => $"acc:b{k}",
+                k =>
+                {
+                    var bit = 1 << k;
+                    return (Action<VRCAvatarParameterDriver>)(d => WNAEAnimator.AddAdd(d, ctx.Acc, -bit));
+                });
+
+            var store = NewStore(ctx, calculation);
+            WNAEChain.Link(stripSources, store,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, modulus) });
+
+            // a が値域外だった場合の受け皿
+            WNAEChain.Link(new[] { join }, store, new[]
+            {
+                WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, (1L << (2 * n)) - 1),
+            });
+
+            // b が値域外だった場合の受け皿
+            WNAEChain.LinkOutOfRange(entry, store, ctx.Tb, 0, modulus - 1);
+
+            return store;
         }
 
         /// <summary>c = (a &lt;&lt; b) &amp; mask。シフト量ごとに定数倍してから上位ビットを落とす。</summary>
-        private static List<VirtualState> BuildShiftLeft(CalcContext ctx, List<VirtualState> current)
+        private static VirtualState BuildShiftLeft(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation)
         {
             var n = ctx.BitWidth;
+            var modulus = ctx.Modulus;
 
             ctx.Column++;
             var branches = new List<VirtualState>();
@@ -708,140 +577,270 @@ namespace WoodenNut.WNAE
             for (var s = 0; s < n; s++)
             {
                 var shift = 1 << s;
-                var state = ctx.NewState($"s={s}", s,
-                    d => WNAEAnimator.AddCopyRange(d, ctx.Acc, ctx.Ta, 0f, 1f, 0f, shift));
+                var state = ctx.NewState($"acc=a×{shift}", s,
+                    d => WNAEAnimator.AddCopyRange(
+                        d, ctx.Acc, ctx.Ta, 0f, modulus, 0f, (float)modulus * shift));
 
-                Link(current, state, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, s) });
+                WNAEChain.Link(entry, state,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, s) });
                 branches.Add(state);
             }
 
             // シフト量がビット幅以上なら全ビットが押し出される（acc は 0 のまま）
-            var fallback = ctx.NewState("s>=N", n, null);
-            LinkOutOfRange(current, fallback, ctx.Tb, 0, n - 1);
+            var fallback = ctx.NewState("s≥N", n, null);
+            WNAEChain.LinkOutOfRange(entry, fallback, ctx.Tb, 0, n - 1);
             branches.Add(fallback);
 
-            if (n <= 1) return branches;
-
             // 積は最大 (2^N-1)×2^(N-1) なので bit 2N-2 … N を落とす
-            return StripHighBits(ctx, branches, 2 * n - 2, n);
+            var sources = branches;
+            if (n >= 2)
+            {
+                sources = WNAEChain.GreedyDispatch(ctx, branches, ctx.Acc, 2 * n - 2, n, 0,
+                    k => 1L << k,
+                    k => $"acc:b{k}",
+                    k =>
+                    {
+                        var bit = 1 << k;
+                        return (Action<VRCAvatarParameterDriver>)(d => WNAEAnimator.AddAdd(d, ctx.Acc, -bit));
+                    });
+            }
+
+            var store = NewStore(ctx, calculation);
+            WNAEChain.Link(sources, store,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Acc, modulus) });
+
+            // a が値域外だった場合の受け皿
+            var junkLimit = n >= 2 ? (1L << (2 * n - 1)) - 1 : modulus - 1;
+            WNAEChain.Link(branches, store,
+                new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Acc, junkLimit) });
+
+            return store;
         }
 
         /// <summary>
-        /// c = a &gt;&gt; b。シフト量ごとに分岐し、ta を bit N-1 から s まで崩して
-        /// acc に 2^(k-s) を積む。s 未満のビットは触らないので自然に切り捨てられる。
+        /// c = a &gt;&gt; b。シフト量ごとに分岐し、ta の立っているビットを消しながら
+        /// acc に 2^(k-s) を積む。bit s 未満が残ったら打ち切る（自然に切り捨てられる）。
         /// </summary>
-        private static List<VirtualState> BuildShiftRight(CalcContext ctx, List<VirtualState> current)
+        private static VirtualState BuildShiftRight(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation)
         {
             var n = ctx.BitWidth;
+            var modulus = ctx.Modulus;
 
             ctx.Column++;
             var dispatchColumn = ctx.Column;
-            var terminals = new List<VirtualState>();
             var maxColumn = ctx.Column;
+            var pending = new List<(List<VirtualState> Sources, VirtualState Branch, int DoneLimit)>();
 
             for (var s = 0; s < n; s++)
             {
                 ctx.Column = dispatchColumn;
 
-                var branch = ctx.NewState($"s={s}", s * 2, null);
-                Link(current, branch, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, s) });
+                var shift = s;
+                var branch = ctx.NewState($"s={s}", s, null);
+                WNAEChain.Link(entry, branch,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, s) });
 
-                var chain = new List<VirtualState> { branch };
-
-                for (var k = n - 1; k >= s; k--)
-                {
-                    var bit = 1 << k;
-                    var weight = 1 << (k - s);
-                    chain = BitLevel(ctx, chain, ctx.Ta, k, s * 2,
-                        d =>
+                var sources = WNAEChain.GreedyDispatch(
+                    ctx, new List<VirtualState> { branch }, ctx.Ta, n - 1, s, s,
+                    k => 1L << k,
+                    k => $"b{k}",
+                    k =>
+                    {
+                        var bit = 1 << k;
+                        var weight = 1 << (k - shift);
+                        return (Action<VRCAvatarParameterDriver>)(d =>
                         {
                             WNAEAnimator.AddAdd(d, ctx.Ta, -bit);
                             WNAEAnimator.AddAdd(d, ctx.Acc, weight);
-                        },
-                        null);
-                }
+                        });
+                    });
 
-                terminals.AddRange(chain);
+                pending.Add((sources, branch, 1 << s));
                 maxColumn = Mathf.Max(maxColumn, ctx.Column);
             }
 
+            // シフト量がビット幅以上なら c = 0（acc は Init の 0 のまま）
             ctx.Column = dispatchColumn;
-            var fallback = ctx.NewState("s>=N", n * 2, null);
-            LinkOutOfRange(current, fallback, ctx.Tb, 0, n - 1);
-            terminals.Add(fallback);
+            var fallback = ctx.NewState("s≥N", n, null);
+            WNAEChain.LinkOutOfRange(entry, fallback, ctx.Tb, 0, n - 1);
 
             ctx.Column = maxColumn;
-            return terminals;
+            var store = NewStore(ctx, calculation);
+
+            foreach (var (sources, branch, doneLimit) in pending)
+            {
+                WNAEChain.Link(sources, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Ta, doneLimit) });
+
+                // a が値域外だった場合の受け皿
+                WNAEChain.Link(new[] { branch }, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Ta, modulus - 1) });
+            }
+
+            WNAEChain.Link(new[] { fallback }, store, null);
+            return store;
+        }
+
+        /// <summary>
+        /// c = a を b ビット回転（L-ROTATE / R-ROTATE）。押し出されたビットは反対側へ回り込む。
+        ///
+        /// 回転は N ビットで一周するため、まず tb から N×2^k を引けるだけ引いて tb mod N に
+        /// 落としてから、N 個の分岐で回転量ごとのビット載せ替えを行う。
+        /// </summary>
+        private static VirtualState BuildRotate(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation,
+            bool right)
+        {
+            var n = ctx.BitWidth;
+            var modulus = ctx.Modulus;
+
+            // tb mod N へ落とす（引く量は常に N の倍数なので剰余は変わらない）
+            var reduceHi = 0;
+            while ((long)n << (reduceHi + 1) <= modulus - 1) reduceHi++;
+
+            var reduced = WNAEChain.GreedyDispatch(ctx, entry, ctx.Tb, reduceHi, 0, 0,
+                k => (long)n << k,
+                k => $"-{n << k}",
+                k =>
+                {
+                    var step = n << k;
+                    return (Action<VRCAvatarParameterDriver>)(d => WNAEAnimator.AddAdd(d, ctx.Tb, -step));
+                });
+
+            ctx.Column++;
+            var dispatchColumn = ctx.Column;
+            var maxColumn = ctx.Column;
+            var pending = new List<(List<VirtualState> Sources, VirtualState Branch)>();
+
+            for (var s = 0; s < n; s++)
+            {
+                ctx.Column = dispatchColumn;
+
+                var rotation = s;
+                var branch = ctx.NewState($"s={s}", s, null);
+                WNAEChain.Link(reduced, branch,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, s) });
+
+                var sources = WNAEChain.GreedyDispatch(
+                    ctx, new List<VirtualState> { branch }, ctx.Ta, n - 1, 0, s,
+                    k => 1L << k,
+                    k => $"b{k}",
+                    k =>
+                    {
+                        var bit = 1 << k;
+
+                        // 回転後の桁。範囲外へ出た分は反対側へ回り込む
+                        var destination = right ? (k - rotation + n) % n : (k + rotation) % n;
+                        var weight = 1 << destination;
+
+                        return (Action<VRCAvatarParameterDriver>)(d =>
+                        {
+                            WNAEAnimator.AddAdd(d, ctx.Ta, -bit);
+                            WNAEAnimator.AddAdd(d, ctx.Acc, weight);
+                        });
+                    });
+
+                pending.Add((sources, branch));
+                maxColumn = Mathf.Max(maxColumn, ctx.Column);
+            }
+
+            // b が値域外なら c = 0（acc は Init の 0 のまま）
+            ctx.Column = dispatchColumn;
+            var fallback = ctx.NewState("b=out", n, null);
+            WNAEChain.LinkOutOfRange(entry, fallback, ctx.Tb, 0, ((long)n << (reduceHi + 1)) - 1);
+
+            ctx.Column = maxColumn;
+            var store = NewStore(ctx, calculation);
+
+            foreach (var (sources, branch) in pending)
+            {
+                WNAEChain.Link(sources, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Ta, 1) });
+
+                // a が値域外だった場合の受け皿
+                WNAEChain.Link(new[] { branch }, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Ta, modulus - 1) });
+            }
+
+            WNAEChain.Link(new[] { fallback }, store, null);
+            return store;
         }
 
         /// <summary>
         /// c = a / b（Div）または a % b（Mod）。
-        /// tb の値ごとに分岐すると除数が定数になるので、b×2^k による二分長除算に落とせる。
+        /// tb の値ごとに分岐すると除数が定数になるので、b×2^k を引けるだけ引く二分長除算に落とせる。
         /// 商が acc に、剰余が ta に残るため、同じチェーンで両方求まる。
         /// </summary>
-        private static List<VirtualState> BuildDivMod(
-            CalcContext ctx, List<VirtualState> current, bool modulo)
+        private static VirtualState BuildDivMod(
+            WNAEChainContext ctx, List<VirtualState> entry, WNAE_ParameterCalculation calculation,
+            bool modulo)
         {
             var modulus = ctx.Modulus;
             var max = modulus - 1;
 
             ctx.Column++;
             var dispatchColumn = ctx.Column;
-            var terminals = new List<VirtualState>();
             var maxColumn = ctx.Column;
-            var row = 0;
+            var pending = new List<(List<VirtualState> Sources, VirtualState Branch, int Divisor, long JunkLimit)>();
 
             for (var b = 1; b < modulus; b++)
             {
                 ctx.Column = dispatchColumn;
 
-                var branch = ctx.NewState($"b={b}", row, null);
-                Link(current, branch, new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, b) });
-
-                var chain = new List<VirtualState> { branch };
+                var divisor = b;
+                var branch = ctx.NewState($"b={b}", b - 1, null);
+                WNAEChain.Link(entry, branch,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Equals, ctx.Tb, divisor) });
 
                 // b×2^k が最大値を超えない範囲の k から始める
                 var top = 0;
-                while ((long)b << (top + 1) <= max) top++;
+                while ((long)divisor << (top + 1) <= max) top++;
 
-                for (var k = top; k >= 0; k--)
-                {
-                    var step = b << k;
-                    var weight = 1 << k;
-
-                    ctx.Column++;
-                    var yes = ctx.NewState($"-{step}", row, d =>
+                var sources = WNAEChain.GreedyDispatch(
+                    ctx, new List<VirtualState> { branch }, ctx.Ta, top, 0, b - 1,
+                    k => (long)divisor << k,
+                    k => $"-{divisor << k}",
+                    k =>
                     {
-                        WNAEAnimator.AddAdd(d, ctx.Ta, -step);
-                        WNAEAnimator.AddAdd(d, ctx.Acc, weight);
+                        var step = divisor << k;
+                        var weight = 1 << k;
+                        return (Action<VRCAvatarParameterDriver>)(d =>
+                        {
+                            WNAEAnimator.AddAdd(d, ctx.Ta, -step);
+                            WNAEAnimator.AddAdd(d, ctx.Acc, weight);
+                        });
                     });
-                    var no = ctx.NewState("skip", row + 1, null);
 
-                    Link(chain, yes,
-                        new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Ta, step - 1) });
-                    Link(chain, no,
-                        new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Ta, step) });
-
-                    chain = new List<VirtualState> { yes, no };
-                }
-
-                terminals.AddRange(chain);
+                pending.Add((sources, branch, divisor, ((long)divisor << (top + 1)) - 1));
                 maxColumn = Mathf.Max(maxColumn, ctx.Column);
-                row += 2;
             }
 
             // b = 0 と値域外はゼロ除算として c = 0 にする
             ctx.Column = dispatchColumn;
-            var zero = ctx.NewState("b=0", row, d =>
+            var zero = ctx.NewState("b=0", modulus - 1, d =>
             {
                 WNAEAnimator.AddSet(d, ctx.Acc, 0f);
                 if (modulo) WNAEAnimator.AddSet(d, ctx.Ta, 0f);
             });
-            LinkOutOfRange(current, zero, ctx.Tb, 1, max);
-            terminals.Add(zero);
+            WNAEChain.LinkOutOfRange(entry, zero, ctx.Tb, 1, max);
 
             ctx.Column = maxColumn;
-            return terminals;
+            var store = NewStore(ctx, calculation);
+
+            foreach (var (sources, branch, divisor, junkLimit) in pending)
+            {
+                // 残りが除数を下回ったら商が確定（剰余は ta に残る）
+                WNAEChain.Link(sources, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Less, ctx.Ta, divisor) });
+
+                // a が値域外だった場合の受け皿
+                WNAEChain.Link(new[] { branch }, store,
+                    new[] { WNAEAnimator.Condition(AnimatorConditionMode.Greater, ctx.Ta, junkLimit) });
+            }
+
+            WNAEChain.Link(new[] { zero }, store, null);
+            return store;
         }
 
         #endregion
@@ -852,21 +851,13 @@ namespace WoodenNut.WNAE
     #region Inspector
 
     [CustomEditor(typeof(WNAE_ParameterCalculation))]
-    internal class WNAE_ParameterCalculationInspector : UnityEditor.Editor
+    internal class WNAE_ParameterCalculationInspector : WNAEBehaviourInspector
     {
         private static readonly string[] OperationLabels =
             Enum.GetValues(typeof(WNAECalcOperation))
                 .Cast<WNAECalcOperation>()
                 .Select(WNAECalc.DisplayName)
                 .ToArray();
-
-        private string[] _intParameters = Array.Empty<string>();
-        private readonly AdvancedDropdownState _dropdownState = new AdvancedDropdownState();
-
-        private void OnEnable()
-        {
-            _intParameters = CollectIntParameters();
-        }
 
         public override void OnInspectorGUI()
         {
@@ -878,14 +869,17 @@ namespace WoodenNut.WNAE
 
             var operation = (WNAECalcOperation)operationProp.enumValueIndex;
 
-            DrawParameterField("A (入力)", serializedObject.FindProperty("parameterA"));
+            DrawParameterRow("A (入力)", serializedObject.FindProperty("parameterA"),
+                IntParameters, "（未選択）");
 
             using (new EditorGUI.DisabledScope(!WNAECalc.UsesB(operation)))
             {
-                DrawParameterField("B (入力)", serializedObject.FindProperty("parameterB"));
+                DrawParameterRow("B (入力)", serializedObject.FindProperty("parameterB"),
+                    IntParameters, "（未選択）");
             }
 
-            DrawParameterField("C (出力)", serializedObject.FindProperty("parameterC"));
+            DrawParameterRow("C (出力)", serializedObject.FindProperty("parameterC"),
+                IntParameters, "（未選択）");
 
             EditorGUILayout.PropertyField(
                 serializedObject.FindProperty("bitWidth"),
@@ -897,93 +891,11 @@ namespace WoodenNut.WNAE
             // Bit Width を決めるための唯一の判断材料なので、これだけは表示する
             var calculation = (WNAE_ParameterCalculation)target;
             EditorGUILayout.LabelField(
-                $"生成 State 数: {WNAECalcExpander.EstimateStateCount(calculation)}",
+                $"生成 State 数: {WNAECalcBuilder.EstimateStateCount(calculation)}",
                 EditorStyles.miniLabel);
 
-            foreach (var issue in WNAECalcExpander.Validate((WNAE_ParameterCalculation)target))
-            {
-                if (issue.Level != WNAEIssueLevel.Error) continue;
-                EditorGUILayout.HelpBox(issue.Message, MessageType.Error);
-            }
-
-            if (GUILayout.Button("パラメータ一覧を再取得"))
-            {
-                _intParameters = CollectIntParameters();
-            }
-        }
-
-        /// <summary>
-        /// 現在のコントローラから Int パラメータを列挙して選ばせる。
-        /// SMB からはアバターを辿れないため、コントローラ自身が唯一の情報源になる。
-        /// 取得できない場合は手入力にフォールバックする。
-        ///
-        /// Popup ではなく AdvancedDropdown を使うのは、Popup が "/" を階層区切りとして解釈するため。
-        /// VRChat のパラメータ名には "/" がよく含まれ、"Costume" と "Costume/Top" が同時にあると
-        /// 片方が一覧から消えてしまう。
-        /// </summary>
-        private void DrawParameterField(string label, SerializedProperty property)
-        {
-            if (_intParameters.Length == 0)
-            {
-                EditorGUILayout.PropertyField(property, new GUIContent(label));
-                return;
-            }
-
-            var fieldRect = EditorGUI.PrefixLabel(
-                EditorGUILayout.GetControlRect(), new GUIContent(label));
-
-            var current = property.stringValue;
-            var content = new GUIContent(string.IsNullOrEmpty(current) ? "（未選択）" : current);
-
-            if (!EditorGUI.DropdownButton(fieldRect, content, FocusType.Keyboard, EditorStyles.popup)) return;
-
-            var candidates = _intParameters
-                .Select(name => new WNAEParameterCatalog.Candidate { Name = name, Source = "" })
-                .ToList();
-
-            // ドロップダウンのコールバックは後で走るため、パスから引き直して安全に書き込む
-            var propertyPath = property.propertyPath;
-            var so = serializedObject;
-
-            var dropdown = new WNAEParameterDropdown(_dropdownState, "Int パラメータ", candidates, selected =>
-            {
-                so.Update();
-                var target = so.FindProperty(propertyPath);
-                if (target == null) return;
-
-                target.stringValue = selected;
-                so.ApplyModifiedProperties();
-            });
-
-            dropdown.Show(fieldRect);
-        }
-
-        /// <summary>
-        /// VRChat SDK の Parameter Driver エディタと同じく、開いている Animator ウィンドウから
-        /// コントローラを取得する。GetWindow だとウィンドウを開いてフォーカスを奪うため、
-        /// 既存インスタンスの検索にとどめている。
-        /// </summary>
-        private static string[] CollectIntParameters()
-        {
-            var toolType = Type.GetType("UnityEditor.Graphs.AnimatorControllerTool, UnityEditor.Graphs");
-            if (toolType == null) return Array.Empty<string>();
-
-            var windows = Resources.FindObjectsOfTypeAll(toolType);
-            if (windows == null || windows.Length == 0) return Array.Empty<string>();
-
-            var property = toolType.GetProperty("animatorController",
-                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
-            if (property == null) return Array.Empty<string>();
-
-            if (!(property.GetValue(windows[0], null) is AnimatorController controller))
-            {
-                return Array.Empty<string>();
-            }
-
-            return controller.parameters
-                .Where(p => p.type == AnimatorControllerParameterType.Int)
-                .Select(p => p.name)
-                .ToArray();
+            DrawErrors(WNAECalcBuilder.Validate(calculation));
+            DrawRefreshButton();
         }
     }
 

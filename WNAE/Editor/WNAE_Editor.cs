@@ -616,10 +616,10 @@ namespace WoodenNut.WNAE
         {
             var controllerContext = ctx.Extension<AnimatorServicesContext>().ControllerContext;
 
-            // Parameter Calculation は CmpInt の値域検出より先に展開する。
+            // Behaviour の展開は CmpInt の値域検出より先に行う。
             // 展開後の "Copy acc -> c" をスキャナが「Convert Range 未使用の Copy」として検出し、
             // 演算結果を CmpInt にする場合は Range Override が必要だと警告できる。
-            WNAECalcExpander.Expand(controllerContext);
+            WNAEBehaviourExpander.Expand(controllerContext);
 
             var intSettings = ctx.AvatarRootObject.GetComponentsInChildren<WNAE_CmpIntSettings>(true);
             var floatSettings = ctx.AvatarRootObject.GetComponentsInChildren<WNAE_CmpFloatSettings>(true);

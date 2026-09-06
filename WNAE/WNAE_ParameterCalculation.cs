@@ -16,9 +16,10 @@ namespace WoodenNut.WNAE
         Xnor,
         ShiftLeft,
         ShiftRight,
+        RotateLeft,
+        RotateRight,
 
         // 既存の Behaviour に保存された値がずれないよう、追加は必ず末尾に行うこと
-        Copy,
     }
 
     /// <summary>
@@ -59,7 +60,7 @@ namespace WoodenNut.WNAE
         /// <summary>この演算が b を使うか。</summary>
         public static bool UsesB(WNAECalcOperation operation)
         {
-            return operation != WNAECalcOperation.Not && operation != WNAECalcOperation.Copy;
+            return operation != WNAECalcOperation.Not;
         }
 
         /// <summary>オーバーフロー時に折り返す法。2 の冪なので上位ビットを落とすだけで求まる。</summary>
@@ -85,7 +86,8 @@ namespace WoodenNut.WNAE
                 case WNAECalcOperation.Xnor: return "XNOR (c = ~(a ^ b))";
                 case WNAECalcOperation.ShiftLeft: return "L-SHIFT (c = a << b)";
                 case WNAECalcOperation.ShiftRight: return "R-SHIFT (c = a >> b)";
-                case WNAECalcOperation.Copy: return "Copy (c = a)";
+                case WNAECalcOperation.RotateLeft: return "L-ROTATE (c = a <<< b)";
+                case WNAECalcOperation.RotateRight: return "R-ROTATE (c = a >>> b)";
                 default: return operation.ToString();
             }
         }

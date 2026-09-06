@@ -2,9 +2,9 @@
 
 ```
 ○名称　　　　：WN-AnimatorExtender
-○バージョン　：α1
+○バージョン　：α2
 ○公開日　　　：2026/08/02
-○更新日　　　：2026/08/02
+○更新日　　　：2026/08/15
 ○作成者　　　：木製ナット
 ○連絡先　　　：Twitter @WoodenNut27
 ○ライセンス　：NYSL
@@ -21,8 +21,8 @@
 
 ※本モジュールは VRChat Inc. とは無関係の非公式ツールです。
 
-VRChat アバター向けの Unity 拡張です。同期パラメータの自動圧縮と、Animator 内での整数演算を提供します。
-3 つの機能はいずれも NDMF の単一パスで一括処理されます。
+VRChat アバター向けの Unity 拡張です。同期パラメータの自動圧縮と、Animator 内での整数演算・ビット列変換を提供します。
+4 つの機能はいずれも NDMF の単一パスで一括処理されます。
 
 ---
 
@@ -36,11 +36,13 @@ VRChat アバター向けの Unity 拡張です。同期パラメータの自動
 | [1. WNAE CmpInt Settings](#1-wnae-cmpint-settings) | **Int** を、実際に使われている値域から必要最小限のビット数へ圧縮する |
 | [2. WNAE CmpFloat Settings](#2-wnae-cmpfloat-settings) | **Float** を、指定した値域と精度（ビット数）へ量子化して圧縮する |
 | [3. WNAE Parameter Calculation](#3-wnae-parameter-calculation) | Animator 内で **Int 同士の四則演算・ビット演算**を行う |
+| [4. WNAE Parameter Encoder / Decoder](#4-wnae-parameter-encoder--decoder) | **8 個の Bool と 1 個の Int** を相互変換する |
 | [他ツールとの関係](#他ツールとの関係) | Modular Avatar / Avatar Optimizer / メニュー / OSC との関係 |
 | [エラーと警告](#エラーと警告) | エラーの一覧と、どこに出るか |
-| [既知の制限・未検証事項](#既知の制限未検証事項) | α1 時点で確認できていないこと |
+| [既知の制限・未検証事項](#既知の制限未検証事項) | 現時点で確認できていないこと |
+| [更新履歴](#更新履歴) | 版ごとの変更点と、α1 から更新する際の注意 |
 
-各機能の節は「概要 → 導入 → Inspector」の順に並んでいます。**使うだけならこの 3 つだけ読めば足ります。**
+各機能の節は「概要 → 導入 → Inspector」を基本の順として並んでいます。**使うだけなら各節の前半（Inspector まで）だけ読めば足ります。**
 
 ### 仕組みを知る
 
@@ -48,7 +50,7 @@ VRChat アバター向けの Unity 拡張です。同期パラメータの自動
 
 | 節 | 内容 |
 |---|---|
-| [ビルド時の共通処理](#ビルド時の共通処理) | 3 機能に共通する展開の流れと、生成物の仕様 |
+| [ビルド時の共通処理](#ビルド時の共通処理) | 4 機能に共通する展開の流れと、生成物の仕様 |
 | [ファイル構成](#ファイル構成) | ソースファイルの役割 |
 
 各機能の節にある「ビルド時の処理 / ビルド時の展開」も同じく実装寄りの内容です。
@@ -80,7 +82,9 @@ Animator 上では**普通の Int パラメータのまま**扱われるため�
 
 ### 導入
 
-アバタールートに **Add Component → WoodenNut → WNAE CmpInt Settings** を追加します。1 つのアバターに 1 個だけ付けられます。
+アバタールートに **Add Component → WoodenNut → WNAE CmpInt Settings** を追加します。
+
+1 つの GameObject に付けられるのは 1 個までですが、**アバター配下であればどの GameObject に置いても構いません**。複数の GameObject に分けて置いた場合、すべてのエントリがまとめて処理されます（衣装プレハブごとに設定を持たせる、といった使い方ができます）。
 
 ビルド時に自動的に取り除かれるため（`IEditorOnly`）、アップロード後のアバターには残りません。
 
@@ -172,7 +176,7 @@ CmpInt / CmpFloat の両方にあります。値域の自動検出とパラメ�
 
 CmpInt 本体は元の `Synced` チェックの状態に関わらず**必ず非同期**（0 bit）になります。同期は生成された Bool が担当します。
 
-生成 Bool は毎フレーム Animator が Set し直すため保存する必要がなく、`Saved` は常に OFF です。
+生成 Bool は Int の値が変わるたびに Animator が Set し直すため保存する必要がなく、`Saved` は常に OFF です。
 
 #### 2. 変換レイヤーの生成（FX のみ）
 
@@ -200,7 +204,7 @@ CmpInt 本体は元の `Synced` チェックの状態に関わらず**必ず非�
 | 65〜128 | 7 bit | 1 bit |
 | 129〜256 | 8 bit | 0 bit（節約なし） |
 
-生成される State 数は、エンコードとデコード合わせて**値の個数 × 2** です。
+生成される State 数は、エンコードとデコード合わせて **値の個数 × 2 + 2** です（各レイヤーに待機用の `Wait` State が 1 個ずつ入ります）。
 
 ---
 
@@ -246,7 +250,7 @@ CmpInt と違い、Float は連続値なので**値域の自動検出は行い�
 
 ### 導入
 
-アバタールートに **Add Component → WoodenNut → WNAE CmpFloat Settings** を追加します。1 つのアバターに 1 個だけ付けられます。CmpInt と同時に使えます。
+アバタールートに **Add Component → WoodenNut → WNAE CmpFloat Settings** を追加します。CmpInt と同時に使えます。配置のルール（1 GameObject につき 1 個・複数に分割可）は CmpInt と同じです。
 
 ### Inspector
 
@@ -303,12 +307,14 @@ Name      [ Blend                  ▼ ]
 
 | Bits | 段階数 | 分解能（0〜1 の場合） | 節約 | 生成 State 数 |
 |---|---|---|---|---|
-| 2 | 4 | 0.3333 | 6 bit | 8 |
-| 3 | 8 | 0.1429 | 5 bit | 16 |
-| 4 | 16 | 0.0667 | 4 bit | 32 |
-| 5 | 32 | 0.0323 | 3 bit | 64 |
-| 6 | 64 | 0.0159 | 2 bit | 128 |
-| 7 | 128 | 0.0079 | 1 bit | 256 |
+| 2 | 4 | 0.3333 | 6 bit | 10 |
+| 3 | 8 | 0.1429 | 5 bit | 18 |
+| 4 | 16 | 0.0667 | 4 bit | 34 |
+| 5 | 32 | 0.0323 | 3 bit | 66 |
+| 6 | 64 | 0.0159 | 2 bit | 130 |
+| 7 | 128 | 0.0079 | 1 bit | 258 |
+
+生成 State 数は `段階数 × 2 + 2`（エンコード / デコードの 2 レイヤー + 各レイヤーの `Wait` State）です。
 
 ---
 
@@ -402,9 +408,9 @@ Animator の State を選択し、**Add Behaviour → WNAE Parameter Calculation
 
 | 項目 | 内容 |
 |---|---|
-| **Operation** | 演算種別（13 種） |
+| **Operation** | 演算種別（14 種） |
 | **A (入力)** | 入力 1 |
-| **B (入力)** | 入力 2。`NOT` と `Copy` では使われないためグレーアウトされます |
+| **B (入力)** | 入力 2。`NOT` では使われないためグレーアウトされます |
 | **C (出力)** | 出力 |
 | **Bit Width** | 演算のビット幅（1〜8、既定 8） |
 
@@ -420,7 +426,6 @@ A / B / C は、**開いている Animator ウィンドウのコントローラ�
 
 | 演算 | 内容 |
 |---|---|
-| **Copy** | `c = a`。b は無視 |
 | **Add** | `c = a + b`。和が `mod` 以上なら `c % mod` |
 | **Sub** | `c = a - b`。差が負なら `c + mod` |
 | **Mul** | `c = a * b`。積が `mod` 以上なら `c % mod` |
@@ -433,8 +438,19 @@ A / B / C は、**開いている Animator ウィンドウのコントローラ�
 | **XNOR** | `c = ~(a ^ b)`（N ビット幅） |
 | **L-SHIFT** | `c = (a << b) & (mod - 1)`。`b >= N` は `c = 0` |
 | **R-SHIFT** | `c = a >> b`。`b >= N` は `c = 0` |
+| **L-ROTATE** | `c = a` を左に `b` ビット回転。押し出されたビットは右端へ回り込む |
+| **R-ROTATE** | `c = a` を右に `b` ビット回転。押し出されたビットは左端へ回り込む |
 
 **ゼロ除算**: `Div` / `Mod` ともに `b = 0` のときは `c = 0` になります。
+
+**回転量**: 回転は N ビットで一周するため、`b` は `b mod N` として扱われます（`N = 8` なら `b = 8` は無回転、`b = 9` は 1 ビット回転）。シフトと違い `b >= N` でも `c = 0` にはなりません。
+
+```
+N = 8, a = 142 (1000 1110), b = 1
+
+L-ROTATE →  29 (0001 1101)
+R-ROTATE →  71 (0100 0111)
+```
 
 > 剰余は **256 ではなく `2^BitWidth`** です。Bit Width が 8 なら `% 256`、4 なら `% 16` になります。
 
@@ -446,14 +462,14 @@ A / B / C は、**開いている Animator ウィンドウのコントローラ�
 
 | 演算 | N=4 | N=6 | N=8 |
 |---|---|---|---|
-| Copy | 2 | 2 | 2 |
-| Add / Sub | 13 | 17 | 21 |
-| NOT | 10 | 14 | 18 |
+| Add / Sub | 8 | 10 | 12 |
+| NOT | 6 | 8 | 10 |
 | AND / OR / XOR / XNOR | 18 | 26 | 34 |
-| L-SHIFT | 13 | 19 | 25 |
-| R-SHIFT | 27 | 51 | 83 |
-| Mul | 27 | 79 | 275 |
-| **Div / Mod** | **70** | **306** | **1262** |
+| L-SHIFT | 10 | 14 | 18 |
+| R-SHIFT | 17 | 30 | 47 |
+| L-ROTATE / R-ROTATE | 25 | 49 | 80 |
+| Mul | 20 | 33 | 54 |
+| **Div / Mod** | **44** | **186** | **760** |
 
 512 State を超える設定では警告が出ます。
 
@@ -461,7 +477,21 @@ A / B / C は、**開いている Animator ウィンドウのコントローラ�
 
 ### 実行にかかるフレーム数
 
-Parameter Driver は **State 進入時にしか実行されない**ため、演算は 1 フレームでは完結しません。おおむね **N+3 フレーム程度**（Bit Width 8 なら 11 フレーム前後、90fps で約 0.12 秒）かかります。
+Parameter Driver は **State 進入時にしか実行されない**ため、演算は 1 フレームでは完結しません。
+
+展開されたチェーンは「立っているビットへ直接跳ぶ」構造なので、所要フレームは入力の**立っているビットの数**で決まります。以下は全入力を通したときの最悪値（括弧内は平均）です。
+
+| 演算 | N=4 | N=6 | N=8 |
+|---|---|---|---|
+| NOT / AND / OR / XOR / XNOR | 6 | 8 | 10 |
+| L-SHIFT | 6 (3.2) | 8 (3.1) | 10 (3.1) |
+| Add / Sub | 7 (5.0) | 9 (6.0) | 11 (7.0) |
+| R-SHIFT | 7 (3.3) | 9 (3.2) | 11 (3.1) |
+| Div / Mod | 7 (3.6) | 9 (3.7) | 11 (3.7) |
+| L-ROTATE / R-ROTATE | 9 (6.0) | 12 (7.5) | 16 (9.5) |
+| Mul | 12 (7.5) | 17 (10.1) | 21 (12.6) |
+
+AND / OR / XOR / XNOR は全ビットを必ず走査するため、平均も最悪値と同じです。それ以外は平均が最悪値をかなり下回ります（Bit Width 8 の最悪 11 フレームは 90fps で約 0.12 秒）。
 
 - 元の State から出ていく遷移は演算チェーンの終端に移されるため、**演算が終わってから評価されます**
 - **State に入った直後に c を読む使い方はできません**
@@ -476,34 +506,43 @@ Parameter Driver は **State 進入時にしか実行されない**ため、演�
 
 ```
 Sub State Machine "WNAE Calc/{元の State 名}"
-   [Init]   Copy a→ta ; Copy b→tb ; Set acc=0   ← 元の State を指していた遷移がここに向く
+   [Init]   入力を中間パラメータへコピー         ← 元の State を指していた遷移がここに向く
    [演算チェーン]
-   [Store]  Copy acc→c                          ← 元の State の出ていく遷移がここに移る
+   [Store]  結果を c へコピー                    ← 元の State の出ていく遷移がここに移る
 ```
 
 - **State に設定されていた Motion と他の Behaviour は失われます**（置き換えのため）。該当する場合は Console に警告が出ます
 - 元の State を指していた遷移は、AnyState / Entry / State / StateMachine のすべてを走査して `Init` に張り替えられます。自己遷移も `Init` に向くため、ループして再計算する使い方ができます
-- 元の State が Default State だった場合は、Entry から Sub State Machine へ入る遷移が追加されます
+- 元の State が Default State だった場合は、Entry から Sub State Machine へ入る遷移が追加されます。条件なしの Entry 遷移は常に成立するため、既存の条件付き Entry 遷移を遮らないよう**末尾**に置かれます（Default State の「どれにも該当しないとき」の役割を引き継ぎます）
+- 元の State に **Exit へ抜ける遷移**があった場合は、Sub State Machine から親へ Exit を伝播する遷移が自動で追加され、「親のステートマシンから抜ける」という元の意味が保たれます
 
 #### 演算の仕組み
 
-`Add` が定数加算しかできないため、**入力を上位ビットから崩しながら acc に定数を足し込む**チェーンが基本形です。分岐は両側に厳密な補集合の条件を持つので、遷移の並び順に依存しません。
+`Add` が定数加算しかできないため、**入力の立っているビットを消しながら acc に定数を足し込む**チェーンが基本形です。各レベルの State へは「最上位の立っているビットが k」という範囲条件 2 つで**それまでのどの State からも直接跳び込める**ため、立っていないビットの分の State を通りません（State 数はビット幅ぶんだけ、所要フレームは立っているビット数だけで済みます）。
 
 ```
-level k (k = N-1 … 0):
-    tb > 2^k - 1  → [b_k=1]  tb -= 2^k ; acc += 2^k
-    tb < 2^k      → [b_k=0]  何もしない
+level k への遷移条件:  value > 2^k - 1  かつ  value < 2^(k+1)
+level k の Driver   :  value -= 2^k ; acc += 2^k（演算ごとの定数）
 ```
 
-`Div` / `Mod` は b の値ごとに分岐すると除数が定数になるため、`b×2^k` による二分長除算に落とせます。商が acc に、剰余が ta に残るので同じチェーンで両方求まります。
+すべての遷移は互いに排他な明示条件を持つので、遷移の並び順には依存しません。また、入力が Bit Width の範囲外でも行き場を失わないよう、受け皿の遷移が張られています（結果は保証されません）。
 
-`Mul` と `L-SHIFT` だけは `Copy` の **Convert Range による定数倍**を使っています。定数倍は除算を含まず結果が厳密な整数になるため、Int への丸め規則に依存しません。
+`Div` / `Mod` は b の値ごとに分岐すると除数が定数になるため、`b×2^k` を引けるだけ引く二分長除算に落とせます。商が acc に、剰余が ta に残るので同じチェーンで両方求まります。
+
+`Mul` は b を上位 / 下位の 2 ブロックに分け、それぞれ `Copy` の **Convert Range による定数倍**で部分積を作ってから足し合わせます（`L-SHIFT` も同じ定数倍を使います）。変換元の範囲は `0〜2^N` にしています。2 の冪なので浮動小数点でも除算が厳密で、入力が必ず変換元範囲に収まるため、**クランプの有無や Int への丸め規則に依存せず**結果が厳密な整数になります。
 
 ---
 
 ### 中間パラメータ
 
-`WNAE/Calc/{連番}/ta` ・ `/tb` ・ `/acc` という Int パラメータが Animator に追加されます。
+`WNAE/Calc/{連番}/ta` ・ `/tb` ・ `/acc`（Mul のみ `/t2` も）という Int パラメータのうち、演算が使うものだけが Animator に追加されます。
+
+| 演算 | 追加される中間パラメータ |
+|---|---|
+| Add / Sub | `tb` / `acc` |
+| NOT | `ta` / `acc` |
+| Mul | `ta` / `tb` / `acc` / `t2` |
+| 上記以外 | `ta` / `tb` / `acc` |
 
 - **VRCExpressionParameters には追加されません**（同期不要）
 - 追加先は、その Behaviour が存在するコントローラのみです
@@ -533,16 +572,135 @@ A / B / C に指定したパラメータがコントローラに存在しない�
 
 ---
 
+## 4. WNAE Parameter Encoder / Decoder
+
+### 概要
+
+**8 個の Bool** と **1 個の Int** を相互に変換する 2 つの Behaviour です。
+
+| Behaviour | 向き |
+|---|---|
+| **WNAE Parameter Encoder** | Bool ×8 → Int（ビット列を 1 バイトにまとめる） |
+| **WNAE Parameter Decoder** | Int → Bool ×8（1 バイトをビット列に分解する） |
+
+Parameter Calculation と同様、State に Add Behaviour すると、その State はビルド時に Sub State Machine へ置き換えられます。
+
+### 導入
+
+Animator の State を選択し、**Add Behaviour → WNAE Parameter Encoder**（または **Decoder**）を追加します。
+
+**Parameter Calculation と同じ State に混ぜて置くこともでき、その場合はリスト順に直列実行されます。** 「Int をビットに分解 → ビットごとに演算 → Int に戻す」といった処理を 1 つの State にまとめられます。
+
+> **この State は変換専用になります。** Parameter Calculation と同じく、**Motion や他の Behaviour を設定しても失われます**。
+
+---
+
+### ビットの並び
+
+**`Bit 1` が LSB（`2^0`）、`Bit 8` が MSB（`2^7`）** です。CmpInt が生成する Bool（`_b0` が LSB）と同じ並びなので、CmpInt の生成 Bool をそのまま Encoder / Decoder に繋げられます。
+
+```
+Bit 8  Bit 7  Bit 6  Bit 5  Bit 4  Bit 3  Bit 2  Bit 1
+ 128     64     32     16      8      4      2      1
+```
+
+---
+
+### Inspector（Encoder）
+
+| 項目 | 内容 |
+|---|---|
+| **出力 (Int)** | エンコード結果の出力先 |
+| **Bit 1 (LSB)** 〜 **Bit 8 (MSB)** | 各ビットの入力元 |
+
+各ビットは **`0 固定` / `1 固定` / Bool パラメータ** から選びます。既定は `0 固定` です。
+
+`0 固定` と `1 固定` は分岐を作らず定数として処理されるため、**使うビットが少ないほど生成 State 数が減ります**。
+
+### Inspector（Decoder）
+
+| 項目 | 内容 |
+|---|---|
+| **入力 (Int)** | デコード対象 |
+| **Bit 1 (LSB)** 〜 **Bit 8 (MSB)** | 各ビットの出力先 Bool。**`（非選択）` にするとそのビットは出力されません** |
+
+---
+
+### 生成 State 数
+
+| Behaviour | 数式 | 例 |
+|---|---|---|
+| Encoder | `2 × (パラメータ指定のビット数) + 2` | 8 ビットすべてパラメータ → 18 |
+| Decoder | `(8 - 最下位の選択ビット) + 2` | Bit 1 まで選択 → 10 / Bit 5 以上のみ選択 → 6 |
+
+Decoder は、選択されていないビットも**それより下のビットを正しく取り出すために分解の対象になります**。そのため、下位ビットを選ぶほど State が増えます。逆に上位ビットだけ使う場合は短く済みます。
+
+Inspector に生成 State 数が表示されます。
+
+---
+
+### ビルド時の展開
+
+[ビルド時の共通処理](#ビルド時の共通処理)で、Parameter Calculation と同じ仕組みで展開されます。
+
+**Encoder**
+
+```
+Sub State Machine "WNAE Encoder/{元の State 名}"
+   [Init]   Set acc = (1 固定ビットの合計)
+   [各パラメータビットの 2 分岐]  Bool が true なら acc += 2^i
+   [Store]  Copy acc → 出力 Int
+```
+
+**Decoder**
+
+```
+Sub State Machine "WNAE Decoder/{元の State 名}"
+   [Init]   Copy 入力 Int → ta ; 選択された出力 Bool をすべて false に
+   [Bit 8 → 最下位の選択ビット]  立っているビットへ直接跳び、ta -= 2^k ; 出力 Bool = true
+   [Done]   （元の State の出ていく遷移がここに移る）
+```
+
+Decoder は演算チェーンと同じ「立っているビットへ直接跳ぶ」構造なので、State はビット位置ごとに 1 つで、立っていないビットにはフレームを消費しません。選択された出力は Init で一旦 false になり、立っているビットだけが後から true になります（完了までの数フレームは過渡状態です）。
+
+中間パラメータは `WNAE/Encoder/{連番}/acc`・`WNAE/Decoder/{連番}/ta` という名前で Animator に追加されます。**VRCExpressionParameters には追加されません**（同期不要）。
+
+---
+
+### Encoder / Decoder 固有のエラーと警告
+
+#### エラー（該当 Behaviour は展開されません）
+
+- Encoder: 出力 Int が指定されていない
+- Encoder: ビットが Bool パラメータ指定なのにパラメータが選ばれていない
+- Decoder: 入力 Int が指定されていない
+- Decoder: 出力先の Bool が 1 つも選択されていない
+
+#### 警告（Console のみ）
+
+- 指定したパラメータが期待と異なる型で存在している
+- Decoder: 同じ Bool が複数のビットに割り当てられている（どちらかのビットが立っていれば true になります）
+
+---
+
+### 制限事項
+
+- **Decoder の入力は 0〜255 を想定しています。** 範囲外の値（256 以上・負数）では正しいビット列は得られません（現在の実装では全ビット false になりますが、保証はしません）
+- Encoder は **パラメータ指定のビット数 + 2 フレーム**、Decoder は **立っているビットの数 + 2 フレーム**程度で完了します（Parameter Driver が State 進入時にしか動かないため 1 フレームでは完結しません）
+
+---
+
 ## ビルド時の共通処理
 
-3 つの機能は**単一の NDMF パス**（`Expand WNAE parameters`）でまとめて処理されます。型ごとにパスを分けると `VRCExpressionParameters` が 2 回クローンされてしまうため、意図的に 1 つに束ねています。
+4 つの機能は**単一の NDMF パス**（`Expand WNAE parameters`）でまとめて処理されます。型ごとにパスを分けると `VRCExpressionParameters` が 2 回クローンされてしまうため、意図的に 1 つに束ねています。
 
 実行タイミングは NDMF の `Transforming` フェーズ、`AfterPlugin("nadena.dev.modular-avatar")` 指定により **Modular Avatar のパラメータリネームとメニュー結合が完了した後**です。
 
 処理順は次の通りです。
 
-0. **Parameter Calculation を展開**（全コントローラ）
+0. **StateMachineBehaviour（Parameter Calculation / Encoder / Decoder）を展開**（全コントローラ）
    - CmpInt の値域検出より前に行うことで、演算結果の書き込みを「値域を静的に決められない Copy」として検出できます
+   - 1 つの State に複数の Behaviour を置いた場合は、リスト順に直列実行されます（種類が違っても構いません）
 1. `WNAE CmpInt Settings` / `WNAE CmpFloat Settings` を収集
 2. それぞれ値域・継承を解決し、検証結果を Console に出力
 3. パラメータ名と生成 Bool 名の重複・衝突を**両方の型をまたいで**検査
@@ -552,14 +710,26 @@ A / B / C に指定したパラメータがコントローラに存在しない�
 5. 元パラメータと生成 Bool 群を**全プレイアブルレイヤーのコントローラ**（Base / Additive / Gesture / Action / FX / Sitting / TPose / IKPose）に宣言
    - これにより、FX で圧縮した結果の Bool を他のレイヤーからも同じ名前で参照できます
 6. 変換レイヤーを **FX にのみ**生成（FX が無い場合は新規作成）
-7. `WNAE CmpInt Settings` / `WNAE CmpFloat Settings` を削除（`WNAE Parameter Calculation` は 0. の時点で取り除かれます）
+7. `WNAE CmpInt Settings` / `WNAE CmpFloat Settings` を削除（Calculation / Encoder / Decoder の Behaviour は 0. の時点で取り除かれます）
 
 ### 生成されるレイヤーの共通仕様
+
+CmpInt / CmpFloat の**変換レイヤー**（AnyState 遷移）の設定は次の通りです。
 
 - `Has Exit Time = OFF` / `Duration = 0` / `Can Transition To Self = OFF`
   - `Can Transition To Self` を OFF にしているのは、Driver が State 進入時にのみ実行されるためです。ON だと毎フレーム再発火します
 - State のモーションは空クリップ（`WNAE Empty`）で、何もアニメートしません
-- `Write Defaults` は対象コントローラの既存 State の多数派に自動的に合わせます（混在による VRChat の警告を避けるため）
+
+Behaviour の**展開チェーン**（State 間の遷移）の設定は次の通りです。
+
+- `Duration = 0` / `Fixed Duration = ON`
+- 条件付きの遷移は `Has Exit Time = OFF`。条件を持たない遷移だけは `Has Exit Time = ON` / `Exit Time = 0` にしています
+  - 条件も Exit Time も無い遷移は Unity では**永久に成立しない**ため、無条件に次へ進みたい箇所では Exit Time 0 が必要です
+- State のモーションは空クリップ（`WNAE Expand Empty`）です
+
+両者に共通する事項は次の通りです。
+
+- `Write Defaults` は変換レイヤーでは対象コントローラの既存 State の多数派に、展開チェーンでは置き換え元の State の値に合わせます（混在による VRChat の警告を避けるため）
 - `IsLocal` は VRChat 組み込みパラメータで、FX に無い場合のみ追加されます。VRCExpressionParameters には追加しません
 
 ---
@@ -577,7 +747,7 @@ A / B / C に指定したパラメータがコントローラに存在しない�
 
 ## エラーと警告
 
-Inspector には**エラーのみ**表示されます（Parameter Calculation の生成 State 数の表示だけは例外）。警告と情報はビルド時に Console へ出力されます（`[WNAE]` 接頭辞）。
+Inspector には**エラーのみ**表示されます（Calculation / Encoder / Decoder の「生成 State 数」の表示だけは例外で、Bit Width や使用ビットを決める判断材料として常に出ます）。警告と情報はビルド時に Console へ出力されます（`[WNAE]` 接頭辞）。
 
 ### CmpInt / CmpFloat 共通のエラー（該当エントリは展開されません）
 
@@ -586,7 +756,7 @@ Inspector には**エラーのみ**表示されます（Parameter Calculation �
 - 生成される Bool 名が既存パラメータ、または他のエントリと衝突している（`Bool Prefix` で回避）
 - 展開後の同期パラメータが 256 bit を超えている
 
-機能ごとの固有エラーは [CmpInt](#cmpint-固有のエラーと警告) / [CmpFloat](#cmpfloat-固有のエラーと警告) / [Parameter Calculation](#parameter-calculation-固有のエラーと警告) を参照してください。
+機能ごとの固有エラーは [CmpInt](#cmpint-固有のエラーと警告) / [CmpFloat](#cmpfloat-固有のエラーと警告) / [Parameter Calculation](#parameter-calculation-固有のエラーと警告) / [Encoder / Decoder](#encoder--decoder-固有のエラーと警告) を参照してください。
 
 ### 情報（Console のみ）
 
@@ -598,12 +768,42 @@ Inspector には**エラーのみ**表示されます（Parameter Calculation �
 
 ## 既知の制限・未検証事項
 
-以下は α1 時点のものです。
+以下は α2 時点のものです。
 
-- **実機（VRChat 上）での動作確認が未了です。** Unity エディタ上での生成結果と、演算ロジックの網羅検証（Bit Width 4 / 8 の全入力組み合わせ）までは確認済みですが、アップロードして複数人で同期させた状態での検証は行っていません
-- **`Copy` の Convert Range が Int へ書き込むときの丸め規則が VRChat SDK のソースから確認できません。** そのため除算を含む用途では使わず、結果が厳密な整数になる定数倍（`Mul` / `L-SHIFT`）に限定しています。万一 `Mul` の結果がずれる場合はこの実装が原因です
+- **実機（VRChat 上）での動作確認が未了です。** Unity エディタ上での生成結果と、演算・変換ロジックの網羅検証（Bit Width 1〜8 の全演算 × 全入力組み合わせ、約 148 万件）までは確認済みですが、アップロードして複数人で同期させた状態での検証は行っていません
+- **`Copy` の Convert Range の実装詳細（クランプの有無・Int への丸め規則）が VRChat SDK のソースから確認できません。** そのため、変換元範囲を 2 の冪（`0〜2^N`）にして入力が必ず範囲内に収まるようにし、結果が浮動小数点でも厳密な整数になる定数倍（`Mul` / `L-SHIFT`）に限定しています。この構成ではクランプ・丸めのどちらの仕様でも結果が変わらないはずですが、実機未確認である点は変わりません
 - **CmpInt の値域自動検出は、OSC や Parameter Calculation の演算結果を追えません。** 該当する場合は `Range` の手入力が必要です
-- Div / Mod は Bit Width 8 で 1 個あたり約 1262 State を生成します。多用する場合は Bit Width を絞ってください
+- Div / Mod は Bit Width 8 で 1 個あたり約 760 State を生成します。多用する場合は Bit Width を絞ってください
+
+---
+
+## 更新履歴
+
+### α2（2026/08/15）
+
+**追加**
+
+- **WNAE Parameter Encoder / Decoder** を追加（Bool ×8 ⇔ Int の相互変換）
+- Parameter Calculation に **L-ROTATE / R-ROTATE** を追加
+- 1 つの State に**種類の違う Behaviour を混在**させて直列実行できるようになりました
+
+**変更**
+
+- Parameter Calculation から **`Copy`（`c = a`。b は無視）を削除**しました
+- 生成される Sub State Machine の構造を見直し、**State 数と所要フレーム数を削減**しました（Bit Width 8 の場合：Div / Mod 1262 → 760、Mul 275 → 54、R-SHIFT 83 → 47、L/R-ROTATE 139 → 80、Add / Sub 21 → 12、Decoder 17 → 10）
+
+**修正**
+
+- 置き換え元の State が Default State だったとき、追加される Entry 遷移が既存の条件付き Entry 遷移を遮っていた問題
+- 置き換え元の State に Exit へ抜ける遷移があったとき、「親のステートマシンから抜ける」という意味が失われていた問題
+- `Mul` / `L-SHIFT` が使う Convert Range の変換元範囲を `0〜1` から `0〜2^N` に変更（クランプの有無や丸め規則に結果が依存しないようにするため）
+
+> **α1 から更新する場合の注意**
+> `Operation` は列挙値の順番で保存されるため、**α1 で `Copy` を選択していた Behaviour は α2 では別の演算として読み込まれます。** 該当する Behaviour は `Operation` を選び直してください。それ以外の演算は影響を受けません。
+
+### α1（2026/08/02）
+
+- WNAE CmpInt Settings / WNAE CmpFloat Settings / WNAE Parameter Calculation を公開
 
 ---
 
@@ -611,13 +811,19 @@ Inspector には**エラーのみ**表示されます（Parameter Calculation �
 
 | ファイル | アセンブリ | 内容 |
 |---|---|---|
-| `WNAE.cs` | Assembly-CSharp | `CmpIntEntry` / `CmpFloatEntry` と値域・ビット計算のユーティリティ |
+| `WNAE.cs` | Assembly-CSharp | `CmpIntEntry` / `CmpFloatEntry` と値域・ビット計算のユーティリティ、Encoder / Decoder のビット列仕様（`WNAECodec`） |
 | `WNAE_CmpIntSettings.cs` | Assembly-CSharp | CmpInt 設定コンポーネント（MonoBehaviour） |
 | `WNAE_CmpFloatSettings.cs` | Assembly-CSharp | CmpFloat 設定コンポーネント（MonoBehaviour） |
 | `WNAE_ParameterCalculation.cs` | Assembly-CSharp | 演算 Behaviour（StateMachineBehaviour） |
-| `Editor/WNAE_Editor.cs` | Assembly-CSharp-Editor | NDMF プラグイン / 単一パス / 共通ヘルパー（検証・カタログ・Animator・ExParams・Inspector 部品） |
+| `WNAE_ParameterEncoder.cs` | Assembly-CSharp | エンコード Behaviour（StateMachineBehaviour） |
+| `WNAE_ParameterDecoder.cs` | Assembly-CSharp | デコード Behaviour（StateMachineBehaviour） |
+| `Editor/WNAE_Editor.cs` | Assembly-CSharp-Editor | NDMF プラグイン / 単一パス / 共通ヘルパー（検証・パラメータカタログ・Animator 操作・ExParams・コンポーネント Inspector の基底） |
 | `Editor/WNAE_CmpIntEditor.cs` | Assembly-CSharp-Editor | CmpInt の値域スキャナ / 展開 / Inspector |
 | `Editor/WNAE_CmpFloatEditor.cs` | Assembly-CSharp-Editor | CmpFloat の展開 / Inspector |
-| `Editor/WNAE_ParameterCalculationEditor.cs` | Assembly-CSharp-Editor | 演算チェーンの展開 / Inspector |
+| `Editor/WNAE_BehaviourExpander.cs` | Assembly-CSharp-Editor | State を Sub State Machine へ差し替える共通機構 / チェーン構築部品（`GreedyDispatch` など） / Behaviour Inspector の基底 |
+| `Editor/WNAE_ParameterCalculationEditor.cs` | Assembly-CSharp-Editor | 演算チェーンの構築 / Inspector |
+| `Editor/WNAE_ParameterCodecEditor.cs` | Assembly-CSharp-Editor | エンコード / デコードチェーンの構築 / Inspector |
+
+3 つの Behaviour（Calculation / Encoder / Decoder）は `IWNAEBehaviourBuilder` を実装してチェーンの構築だけを担当し、State の差し替えと遷移の張り替えは `WNAE_BehaviourExpander.cs` が共通で行います。そのため **1 つの State に種類の違う Behaviour を混在させても、リスト順に直列実行されます**。
 
 `MonoBehaviour` と `StateMachineBehaviour`（いずれも Unity が MonoScript を必要とする型）は、**クラス名とファイル名を一致させないと Add Component / Add Behaviour の一覧に出てきません**。そのためこれらはそれぞれ専用ファイルに分けています。

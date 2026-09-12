@@ -22,7 +22,7 @@ namespace WoodenNut.WNAE
 
         /// <summary>
         /// 要素数を補正した配列を返す。
-        /// ビルド時に読まれる SMB はユーザーのアセットの実体（NDMF は複製しない）なので、
+        /// 呼び出し元がビルド中の複製か元アセットかに依存しないよう、
         /// フィールドには書き戻さず、補正が必要なときだけ別の配列を返す。
         /// </summary>
         public string[] NormalizedBits()

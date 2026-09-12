@@ -24,7 +24,7 @@ namespace WoodenNut.WNAE
 
     /// <summary>
     /// State に Add Behaviour して <c>c = a op b</c> を宣言する。
-    /// ビルド時にこの State の後ろへ Sub State Machine が生成され、
+    /// ビルド時にこの State 自体が Sub State Machine へ置き換えられ、
     /// Parameter Driver と遷移条件の組み合わせに展開される。
     ///
     /// StateMachineBehaviour は ScriptableObject 派生なので、Unity の制約により

@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
 namespace WoodenNut.WNAE
@@ -24,6 +25,26 @@ namespace WoodenNut.WNAE
     /// <summary>CmpInt / CmpFloat で共通のビット操作。</summary>
     public static class WNAEUtil
     {
+        [StructLayout(LayoutKind.Explicit)]
+        private struct FloatBits
+        {
+            [FieldOffset(0)] public float Value;
+            [FieldOffset(0)] public int Bits;
+        }
+
+        // Animator の厳密な Less 条件で x <= boundary を表すための次の float。
+        // 任意の epsilon を足すと重複区間が生じるため、必ず 1 ULP だけ進める。
+        public static float NextFloatUp(float value)
+        {
+            if (float.IsNaN(value) || value == float.PositiveInfinity) return value;
+            if (value == 0f) return float.Epsilon;
+            var bits = new FloatBits { Value = value };
+            bits.Bits += value > 0f ? 1 : -1;
+            return bits.Value;
+        }
+
+        public static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
         /// <summary>VRChat の同期 Int / Float が消費するビット数。</summary>
         public const int UncompressedCost = 8;
 
@@ -99,7 +120,7 @@ namespace WoodenNut.WNAE
         public bool IsValid => Max >= Min;
 
         /// <summary>取り得る値の個数。</summary>
-        public int ValueCount => IsValid ? Max - Min + 1 : 0;
+        public long ValueCount => IsValid ? (long)Max - Min + 1 : 0;
 
         /// <summary>同期に必要な Bool の本数。</summary>
         public int BitCount => CmpIntUtil.BitCount(ValueCount);
@@ -118,16 +139,17 @@ namespace WoodenNut.WNAE
     public static class CmpIntUtil
     {
         /// <summary>valueCount 個の値を表現するのに必要な最小ビット数。</summary>
-        public static int BitCount(int valueCount)
+        public static int BitCount(long valueCount)
         {
             if (valueCount <= 2) return 1;
 
             // Log2 の丸め誤差を避けるため整数演算で求める
             int bits = 0;
-            int capacity = 1;
-            while (capacity < valueCount)
+            // 容量を左シフトして増やす方法はオーバーフロー後に停止しなくなる。
+            long remaining = valueCount - 1;
+            while (remaining > 0)
             {
-                capacity <<= 1;
+                remaining >>= 1;
                 bits++;
             }
             return bits;
@@ -219,12 +241,22 @@ namespace WoodenNut.WNAE
         public float Step => (Max - Min) / (Levels - 1);
 
         /// <summary>index 段目が表す値。index=0 で Min、index=Levels-1 で Max。</summary>
-        public float ValueOf(int index) => Min + index * Step;
+        public float ValueOf(int index) => index == Levels - 1 ? Max : Min + index * Step;
 
         /// <summary>value を最も近い段階に量子化したときのインデックス。</summary>
         public int IndexOf(float value)
         {
-            return Mathf.Clamp(Mathf.RoundToInt((Clamp(value) - Min) / Step), 0, Levels - 1);
+            // 生成する Greater 条件と同じ規則にする。中点ちょうどは下側へ。
+            // RoundToInt の偶数丸めを使うと、Default と実行時のビット列が食い違う。
+            if (float.IsNaN(value)) return 0;
+            int low = 0, high = Levels - 1;
+            while (low < high)
+            {
+                var mid = low + (high - low + 1) / 2;
+                if (value > LowerThreshold(mid)) low = mid;
+                else high = mid - 1;
+            }
+            return low;
         }
 
         /// <summary>

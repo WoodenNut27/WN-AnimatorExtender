@@ -16,6 +16,7 @@ using ReorderableList = UnityEditorInternal.ReorderableList;
 using Object = UnityEngine.Object;
 
 [assembly: ExportsPlugin(typeof(WoodenNut.WNAE.WNAEPlugin))]
+[assembly: ExportsPlugin(typeof(WoodenNut.WNAE.WNAEBehaviourPlugin))]
 
 namespace WoodenNut.WNAE
 {
@@ -68,6 +69,17 @@ namespace WoodenNut.WNAE
             return resolved.Issues.Where(i => i.Level == WNAEIssueLevel.Error);
         }
 
+        /// <summary>
+        /// 致命的なエラーを NDMF のエラーレポートへ登録する。
+        /// Debug.LogError は BuildContext.Successful に反映されず、SDK の UI からビルドする
+        /// 利用者にも届かないため、アップロードを止めるべきものはこちらで報告する。
+        /// </summary>
+        public static void ReportFatal(string message)
+        {
+            UnityEngine.Debug.LogError(message);
+            ErrorReport.ReportError(new WNAEError(message, ErrorSeverity.Error));
+        }
+
         public static void LogAll(IWNAEResolved resolved, string kind, string label)
         {
             foreach (var issue in resolved.Issues)
@@ -76,7 +88,7 @@ namespace WoodenNut.WNAE
                 switch (issue.Level)
                 {
                     case WNAEIssueLevel.Error:
-                        UnityEngine.Debug.LogError(message);
+                        ReportFatal(message);
                         break;
                     case WNAEIssueLevel.Warning:
                         UnityEngine.Debug.LogWarning(message);
@@ -89,79 +101,114 @@ namespace WoodenNut.WNAE
         }
     }
 
+    /// <summary>
+    /// NDMF のエラーレポートに載せる WNAE のエラー。
+    /// Severity.Error は NDMF 側でアップロードをブロックする。
+    /// </summary>
+    internal class WNAEError : IError
+    {
+        private readonly string _message;
+
+        public WNAEError(string message, ErrorSeverity severity)
+        {
+            _message = message;
+            Severity = severity;
+        }
+
+        public ErrorSeverity Severity { get; }
+
+        // エラー報告ウィンドウ用の表示は既定のままで足りるため独自 UI は持たない
+        public UnityEngine.UIElements.VisualElement CreateVisualElement(ErrorReport report) => null;
+
+        public string ToMessage() => _message;
+
+        public void AddReference(ObjectReference obj) { }
+    }
+
     /// <summary>パラメータ名と生成 Bool 名の重複 / 衝突を、CmpInt と CmpFloat をまたいで検査する。</summary>
     internal static class WNAENameValidator
     {
         public static void Validate(
             IReadOnlyList<IWNAEResolved> items, ICollection<string> existingParameterNames)
         {
-            // 自分たちが所有する名前は「衝突」ではないので、既存名から差し引く
-            var owned = new HashSet<string>();
+            // 本体名は既存パラメータの参照、Bool 名は新しい名前の予約として扱う。
+            // 検査中に Issues が変わっても対象が変わらないよう、先に全予約を集める。
+            var claims = new Dictionary<string, List<IWNAEResolved>>(StringComparer.Ordinal);
+            var generated = new List<(IWNAEResolved Owner, string Name)>();
             foreach (var item in items)
             {
+                if (!string.IsNullOrWhiteSpace(item.ParameterName)) Claim(item.ParameterName, item);
                 if (!item.IsNameCheckable) continue;
-
-                owned.Add(item.ParameterName);
-                for (var i = 0; i < item.BitCount; i++) owned.Add(item.BoolNameAt(i));
+                for (var i = 0; i < item.BitCount; i++)
+                {
+                    var name = item.BoolNameAt(i);
+                    Claim(name, item);
+                    generated.Add((item, name));
+                }
             }
 
-            var foreign = new HashSet<string>(existingParameterNames ?? Array.Empty<string>());
-            foreign.ExceptWith(owned);
-
-            var seenNames = new Dictionary<string, int>();
-            var seenBools = new Dictionary<string, int>();
-
-            for (var i = 0; i < items.Count; i++)
+            foreach (var pair in claims.Where(p => p.Value.Count > 1))
             {
-                var item = items[i];
-                if (!item.IsNameCheckable) continue;
-
-                if (seenNames.TryGetValue(item.ParameterName, out var prev))
+                // 両側を拒否し、エントリの並び順でどちらかが上書きされるのを防ぐ。
+                foreach (var item in pair.Value.Distinct())
                 {
                     item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
-                        $"パラメータ名 \"{item.ParameterName}\" が {prev + 1} 番目のエントリと重複しています。"));
+                        $"パラメータ名または生成 Bool 名 \"{pair.Key}\" が重複しています。" +
+                        "Name / Bool Prefix を確認してください。"));
                 }
-                else
+            }
+
+            var existing = new HashSet<string>(existingParameterNames ?? Array.Empty<string>(), StringComparer.Ordinal);
+            foreach (var (owner, name) in generated)
+            {
+                if (existing.Contains(name))
                 {
-                    seenNames[item.ParameterName] = i;
+                    owner.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
+                        $"生成される Bool 名 \"{name}\" が既存のパラメータと衝突しています。" +
+                        "Bool Prefix を設定してください。"));
                 }
+            }
 
-                for (var b = 0; b < item.BitCount; b++)
-                {
-                    var boolName = item.BoolNameAt(b);
-
-                    if (foreign.Contains(boolName))
-                    {
-                        item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
-                            $"生成される Bool 名 \"{boolName}\" が既存のパラメータと衝突しています。" +
-                            "Bool Prefix を設定してください。"));
-                    }
-
-                    if (seenBools.TryGetValue(boolName, out var prevBool) && prevBool != i)
-                    {
-                        item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
-                            $"生成される Bool 名 \"{boolName}\" が {prevBool + 1} 番目のエントリと衝突しています。"));
-                    }
-                    else
-                    {
-                        seenBools[boolName] = i;
-                    }
-                }
+            void Claim(string name, IWNAEResolved owner)
+            {
+                if (!claims.TryGetValue(name, out var owners)) claims[name] = owners = new List<IWNAEResolved>();
+                owners.Add(owner);
             }
         }
 
-        public static HashSet<string> CollectExistingNames(VRCAvatarDescriptor descriptor)
+        public static HashSet<string> CollectExistingNames(
+            VRCAvatarDescriptor descriptor, IEnumerable<VirtualAnimatorController> controllers = null)
         {
-            var existing = new HashSet<string>();
-            if (descriptor == null || descriptor.expressionParameters == null ||
-                descriptor.expressionParameters.parameters == null)
-            {
-                return existing;
-            }
-
-            foreach (var p in descriptor.expressionParameters.parameters)
+            var existing = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var p in descriptor?.expressionParameters?.parameters ??
+                              Array.Empty<VRCExpressionParameters.Parameter>())
             {
                 if (p != null && !string.IsNullOrEmpty(p.name)) existing.Add(p.name);
+            }
+
+            if (controllers != null)
+            {
+                foreach (var controller in controllers.Where(c => c != null))
+                    existing.UnionWith(controller.Parameters.Keys);
+            }
+            else if (descriptor != null)
+            {
+                // Inspector でも Animator 専用のパラメータと MA Merge Animator を検査する。
+                var sources = (descriptor.baseAnimationLayers ?? Array.Empty<VRCAvatarDescriptor.CustomAnimLayer>())
+                    .Concat(descriptor.specialAnimationLayers ?? Array.Empty<VRCAvatarDescriptor.CustomAnimLayer>())
+                    .Select(l => l.animatorController)
+                    .Concat(descriptor.GetComponentsInChildren<Animator>(true).Select(a => a.runtimeAnimatorController))
+                    .Concat(descriptor.GetComponentsInChildren<IVirtualizeAnimatorController>(true)
+                        .Select(a => a.AnimatorController));
+                foreach (var source in sources.Distinct())
+                {
+                    var controller = source;
+                    var visited = new HashSet<RuntimeAnimatorController>();
+                    while (controller is AnimatorOverrideController overrides && visited.Add(controller))
+                        controller = overrides.runtimeAnimatorController;
+                    if (controller is AnimatorController ac)
+                        existing.UnionWith(ac.parameters.Select(p => p.name));
+                }
             }
 
             return existing;
@@ -371,7 +418,7 @@ namespace WoodenNut.WNAE
 
             if (cost > VRCExpressionParameters.MAX_PARAMETER_COST)
             {
-                UnityEngine.Debug.LogError(
+                WNAEIssueUtil.ReportFatal(
                     $"[WNAE] 展開後の同期パラメータが {cost} bit で、上限 " +
                     $"{VRCExpressionParameters.MAX_PARAMETER_COST} bit を超えています。");
             }
@@ -588,6 +635,27 @@ namespace WoodenNut.WNAE
     #region NDMF plugin
 
     /// <summary>
+    /// MA が参照名を書き換えられるよう、独自 Behaviour を先に公式 Driver へ下げる。
+    /// パラメータ圧縮は別プラグインで MA の後に行い、ExpressionParameters は一度だけ複製する。
+    /// </summary>
+    public class WNAEBehaviourPlugin : Plugin<WNAEBehaviourPlugin>
+    {
+        public override string QualifiedName => "wooden-nut.wnae.behaviours";
+        public override string DisplayName => "WNAE Behaviours";
+
+        protected override void Configure()
+        {
+            InPhase(BuildPhase.Transforming)
+                .BeforePlugin("nadena.dev.modular-avatar")
+                .BeforePlugin("wooden-nut.wnae")
+                .WithRequiredExtension(typeof(AnimatorServicesContext), seq =>
+                    seq.Run("Expand WNAE behaviours", ctx => WNAEBehaviourExpander.Expand(
+                        ctx.Extension<AnimatorServicesContext>().ControllerContext,
+                        WNAENameValidator.CollectExistingNames(ctx.AvatarRootObject.GetComponent<VRCAvatarDescriptor>()))));
+        }
+    }
+
+    /// <summary>
     /// CmpInt / CmpFloat をビルド時に同期 Bool 群へ展開する NDMF プラグイン。
     /// </summary>
     public class WNAEPlugin : Plugin<WNAEPlugin>
@@ -616,10 +684,8 @@ namespace WoodenNut.WNAE
         {
             var controllerContext = ctx.Extension<AnimatorServicesContext>().ControllerContext;
 
-            // Behaviour の展開は CmpInt の値域検出より先に行う。
-            // 展開後の "Copy acc -> c" をスキャナが「Convert Range 未使用の Copy」として検出し、
-            // 演算結果を CmpInt にする場合は Range Override が必要だと警告できる。
-            WNAEBehaviourExpander.Expand(controllerContext);
+            // Behaviour は WNAEBehaviourPlugin が MA より前に展開済み。
+            // ここで再展開すると MA が変更した参照名に追従できない。
 
             var intSettings = ctx.AvatarRootObject.GetComponentsInChildren<WNAE_CmpIntSettings>(true);
             var floatSettings = ctx.AvatarRootObject.GetComponentsInChildren<WNAE_CmpFloatSettings>(true);
@@ -643,7 +709,22 @@ namespace WoodenNut.WNAE
 
                 // 名前の衝突は CmpInt と CmpFloat をまたいで起こり得るのでまとめて検査する
                 var all = ints.Cast<IWNAEResolved>().Concat(floats).ToList();
-                WNAENameValidator.Validate(all, WNAENameValidator.CollectExistingNames(descriptor));
+                var finalNames = WNAENameValidator.CollectExistingNames(descriptor, controllers);
+                WNAENameValidator.Validate(all, finalNames);
+
+                // Cmp 設定の Name は独自コンポーネント内のただの文字列で、MA はこれを書き換えない。
+                // MA のリネーム先を後から変更すると保存済みの名前だけが古いまま残り、
+                // 実在しないパラメータを新規に作って圧縮したつもりになる（本来の対象は無圧縮のまま）。
+                // ここは MA の後なので、最終的な名前として存在するかを検査できる。
+                foreach (var item in all)
+                {
+                    if (string.IsNullOrWhiteSpace(item.ParameterName)) continue;
+                    if (finalNames.Contains(item.ParameterName)) continue;
+
+                    item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
+                        $"パラメータ \"{item.ParameterName}\" が見つかりません。" +
+                        "Modular Avatar のリネーム先を変更した場合は、この項目を選び直してください。"));
+                }
 
                 var acceptedInts = Accept(ints, "CmpInt", CmpIntExpander.DescribeResult);
                 var acceptedFloats = Accept(floats, "CmpFloat", CmpFloatExpander.DescribeResult);
@@ -686,7 +767,8 @@ namespace WoodenNut.WNAE
 
                 if (item.HasError())
                 {
-                    UnityEngine.Debug.LogError($"[WNAE] {kind} \"{label}\" はエラーのため展開をスキップしました。");
+                    WNAEIssueUtil.ReportFatal(
+                        $"[WNAE] {kind} \"{label}\" はエラーのため展開をスキップしました。");
                     continue;
                 }
 

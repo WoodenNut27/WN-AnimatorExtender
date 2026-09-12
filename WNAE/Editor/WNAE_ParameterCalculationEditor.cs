@@ -35,6 +35,20 @@ namespace WoodenNut.WNAE
             return Validate((WNAE_ParameterCalculation)behaviour);
         }
 
+        public IEnumerable<KeyValuePair<string, AnimatorControllerParameterType>> RequiredParameters(
+            StateMachineBehaviour behaviour)
+        {
+            var calculation = (WNAE_ParameterCalculation)behaviour;
+            var type = AnimatorControllerParameterType.Int;
+
+            yield return new KeyValuePair<string, AnimatorControllerParameterType>(calculation.parameterA, type);
+            if (WNAECalc.UsesB(calculation.operation))
+            {
+                yield return new KeyValuePair<string, AnimatorControllerParameterType>(calculation.parameterB, type);
+            }
+            yield return new KeyValuePair<string, AnimatorControllerParameterType>(calculation.parameterC, type);
+        }
+
         public void Prepare(
             VirtualAnimatorController controller, WNAEChainContext ctx, StateMachineBehaviour behaviour)
         {

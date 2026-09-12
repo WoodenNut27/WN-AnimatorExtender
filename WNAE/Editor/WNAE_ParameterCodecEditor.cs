@@ -51,6 +51,23 @@ namespace WoodenNut.WNAE
             return issues;
         }
 
+        public IEnumerable<KeyValuePair<string, AnimatorControllerParameterType>> RequiredParameters(
+            StateMachineBehaviour behaviour)
+        {
+            var encoder = (WNAE_ParameterEncoder)behaviour;
+
+            yield return new KeyValuePair<string, AnimatorControllerParameterType>(
+                encoder.outputParameter, AnimatorControllerParameterType.Int);
+
+            foreach (var bit in encoder.NormalizedBits())
+            {
+                if (bit.source != WNAEBitSource.Parameter) continue;
+
+                yield return new KeyValuePair<string, AnimatorControllerParameterType>(
+                    bit.parameterName, AnimatorControllerParameterType.Bool);
+            }
+        }
+
         public void Prepare(
             VirtualAnimatorController controller, WNAEChainContext ctx, StateMachineBehaviour behaviour)
         {
@@ -170,6 +187,23 @@ namespace WoodenNut.WNAE
             }
 
             return issues;
+        }
+
+        public IEnumerable<KeyValuePair<string, AnimatorControllerParameterType>> RequiredParameters(
+            StateMachineBehaviour behaviour)
+        {
+            var decoder = (WNAE_ParameterDecoder)behaviour;
+
+            yield return new KeyValuePair<string, AnimatorControllerParameterType>(
+                decoder.inputParameter, AnimatorControllerParameterType.Int);
+
+            foreach (var name in decoder.NormalizedBits())
+            {
+                if (string.IsNullOrEmpty(name)) continue;
+
+                yield return new KeyValuePair<string, AnimatorControllerParameterType>(
+                    name, AnimatorControllerParameterType.Bool);
+            }
         }
 
         public void Prepare(

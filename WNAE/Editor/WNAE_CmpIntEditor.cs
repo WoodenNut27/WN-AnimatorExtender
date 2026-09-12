@@ -39,7 +39,8 @@ namespace WoodenNut.WNAE
         public string BoolNameAt(int index) => Entry.BoolName(index);
 
         public bool IsNameCheckable =>
-            Entry != null && !string.IsNullOrWhiteSpace(Entry.name) && Range.IsValid;
+            Entry != null && !string.IsNullOrWhiteSpace(Entry.name) && Range.IsValid &&
+            Range.ValueCount <= CmpIntExpander.MaxValueCount;
     }
 
     #endregion
@@ -108,13 +109,13 @@ namespace WoodenNut.WNAE
                         // Greater/Less は境界しか分からない。少なくとも境界の隣は到達し得る
                         case AnimatorConditionMode.Greater:
                             Observe(threshold);
-                            Observe(threshold + 1);
+                            if (threshold < int.MaxValue) Observe(threshold + 1);
                             SawInequality = true;
                             break;
 
                         case AnimatorConditionMode.Less:
                             Observe(threshold);
-                            Observe(threshold - 1);
+                            if (threshold > int.MinValue) Observe(threshold - 1);
                             SawInequality = true;
                             break;
                     }
@@ -173,6 +174,9 @@ namespace WoodenNut.WNAE
                 if (control.parameter == null || control.parameter.name != _parameter) return;
 
                 Observe(control.value);
+                // Toggle / Button / SubMenu / Puppet の主パラメータは、非アクティブ時に 0 へ戻る。
+                // Default が 0 とは限らないため、明示的に観測する。
+                Observe(0);
             }
 
             public void ObserveBlendTreeThresholds(string blendParameter, string blendParameterY,
@@ -595,9 +599,12 @@ namespace WoodenNut.WNAE
                 controller, "Enc/" + entry.name, emptyClip, writeDefaults);
 
             var transitions = new List<VirtualStateTransition>();
+            VirtualState first = null;
+            VirtualState last = null;
 
-            for (var value = item.Range.Min; value <= item.Range.Max; value++)
+            for (var offset = 0; offset < item.Range.ValueCount; offset++)
             {
+                var value = (int)((long)item.Range.Min + offset);
                 var index = item.Range.IndexOf(value);
 
                 var state = stateMachine.AddState($"={value}", emptyClip, new Vector3(320f, index * 55f, 0f));
@@ -617,6 +624,27 @@ namespace WoodenNut.WNAE
                     WNAEAnimator.Condition(AnimatorConditionMode.If, WNAEAnimator.IsLocalParameter, 0f),
                     WNAEAnimator.Condition(AnimatorConditionMode.Equals, entry.name, value),
                 }));
+
+                first = first ?? state;
+                last = state;
+            }
+
+            // 値域外の入力は端へクランプする。受け皿が無いとどの遷移も成立せず、
+            // 生成 Bool が直前の値のまま固まってリモートとの不一致が解消されない。
+            // CmpFloat は最下段・最上段が受け皿になっているので、意味論をそろえる。
+            if (first != null)
+            {
+                transitions.Add(WNAEAnimator.CreateAnyStateTransition(first, new[]
+                {
+                    WNAEAnimator.Condition(AnimatorConditionMode.If, WNAEAnimator.IsLocalParameter, 0f),
+                    WNAEAnimator.Condition(AnimatorConditionMode.Less, entry.name, item.Range.Min),
+                }));
+
+                transitions.Add(WNAEAnimator.CreateAnyStateTransition(last, new[]
+                {
+                    WNAEAnimator.Condition(AnimatorConditionMode.If, WNAEAnimator.IsLocalParameter, 0f),
+                    WNAEAnimator.Condition(AnimatorConditionMode.Greater, entry.name, item.Range.Max),
+                }));
             }
 
             stateMachine.AnyStateTransitions = ImmutableList.CreateRange(transitions);
@@ -635,8 +663,9 @@ namespace WoodenNut.WNAE
 
             var transitions = new List<VirtualStateTransition>();
 
-            for (var value = item.Range.Min; value <= item.Range.Max; value++)
+            for (var offset = 0; offset < item.Range.ValueCount; offset++)
             {
+                var value = (int)((long)item.Range.Min + offset);
                 var index = item.Range.IndexOf(value);
 
                 var state = stateMachine.AddState($"={value}", emptyClip, new Vector3(320f, index * 55f, 0f));

@@ -190,6 +190,13 @@ namespace WoodenNut.WNAE
 
         List<WNAEIssue> Validate(StateMachineBehaviour behaviour);
 
+        /// <summary>
+        /// この Behaviour が読み書きするパラメータと、その期待型。
+        /// 既存宣言と型が食い違う場合は展開前にエラーにするために使う。
+        /// </summary>
+        IEnumerable<KeyValuePair<string, AnimatorControllerParameterType>> RequiredParameters(
+            StateMachineBehaviour behaviour);
+
         /// <summary>使用するパラメータをコントローラに宣言する。</summary>
         void Prepare(
             VirtualAnimatorController controller, WNAEChainContext ctx, StateMachineBehaviour behaviour);
@@ -234,11 +241,47 @@ namespace WoodenNut.WNAE
             return null;
         }
 
-        public static void Expand(VirtualControllerContext controllerContext)
+        /// <summary>
+        /// 要求する型と既存宣言の型が食い違っていないか調べる。
+        /// 警告のまま展開すると、Bool に 0〜255 を書く・Float を Int として評価するなど、
+        /// ビルドは成功したまま結果だけが無言で変質する。
+        /// </summary>
+        private static List<WNAEIssue> CheckParameterTypes(
+            VirtualAnimatorController controller,
+            IWNAEBehaviourBuilder builder,
+            StateMachineBehaviour behaviour)
+        {
+            var issues = new List<WNAEIssue>();
+
+            foreach (var required in builder.RequiredParameters(behaviour))
+            {
+                if (string.IsNullOrEmpty(required.Key)) continue;
+                if (!controller.Parameters.TryGetValue(required.Key, out var existing)) continue;
+                if (existing.type == required.Value) continue;
+
+                issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
+                    $"\"{required.Key}\" は {existing.type} 型で宣言されていますが、" +
+                    $"この Behaviour は {required.Value} 型として扱います。型が一致するパラメータを指定してください。"));
+            }
+
+            return issues;
+        }
+
+        public static void Expand(VirtualControllerContext controllerContext, ICollection<string> existingNames = null)
+        {
+            // Controllers.Values だけでは未マージの IVirtualizeAnimatorController を取りこぼす。
+            ExpandControllers(controllerContext.CloneContext, controllerContext.GetAllControllers(), existingNames);
+        }
+
+        internal static void ExpandControllers(
+            CloneContext cloneContext, IEnumerable<VirtualAnimatorController> source, ICollection<string> existingNames = null)
         {
             var index = 0;
+            var controllers = source.Where(c => c != null).Distinct().ToList();
+            var reserved = new HashSet<string>(existingNames ?? Array.Empty<string>(), StringComparer.Ordinal);
+            foreach (var controller in controllers) reserved.UnionWith(controller.Parameters.Keys);
 
-            foreach (var controller in controllerContext.Controllers.Values.ToList())
+            foreach (var controller in controllers)
             {
                 if (controller == null) continue;
 
@@ -253,11 +296,13 @@ namespace WoodenNut.WNAE
                     var targets = new List<Target>();
                     Collect(controller, root, targets);
 
+                    var expanded = new List<VirtualStateMachine>();
                     foreach (var target in targets)
                     {
                         clip = clip ?? VirtualClip.Create("WNAE Expand Empty");
-                        ExpandState(controllerContext, controller, root, target, clip, ref index);
+                        expanded.Add(ExpandState(cloneContext, controller, root, target, clip, reserved, ref index));
                     }
+                    GuardAnyStateReentry(controller, root, expanded, reserved, ref index);
                 }
             }
         }
@@ -282,7 +327,7 @@ namespace WoodenNut.WNAE
 
                 var label = $"{controller.Name} / {state.Name}";
 
-                // SMB はユーザーのコントローラアセットの実体なので、リストから外すだけにする
+                // NDMF の ImportBehaviour は複製するが、ここでは共有参照も壊さずリストから外すだけにする。
                 state.Behaviours = state.Behaviours.RemoveAll(b => BuilderFor(b) != null);
 
                 var accepted = new List<StateMachineBehaviour>();
@@ -290,6 +335,7 @@ namespace WoodenNut.WNAE
                 {
                     var builder = BuilderFor(behaviour);
                     var issues = builder.Validate(behaviour);
+                    issues.AddRange(CheckParameterTypes(controller, builder, behaviour));
 
                     foreach (var issue in issues)
                     {
@@ -324,19 +370,20 @@ namespace WoodenNut.WNAE
         }
 
         /// <summary>元の State を、生成したチェーンを収めた Sub State Machine で置き換える。</summary>
-        private static void ExpandState(
-            VirtualControllerContext controllerContext,
+        private static VirtualStateMachine ExpandState(
+            CloneContext cloneContext,
             VirtualAnimatorController controller,
             VirtualStateMachine layerRoot,
             Target target,
             VirtualClip clip,
+            HashSet<string> reserved,
             ref int index)
         {
             var parent = target.Parent;
             var state = target.State;
 
             var namePrefix = BuilderFor(target.Behaviours[0]).SubStateMachinePrefix;
-            var sub = VirtualStateMachine.Create(controllerContext.CloneContext, namePrefix + state.Name);
+            var sub = VirtualStateMachine.Create(cloneContext, namePrefix + state.Name);
 
             parent.StateMachines = parent.StateMachines.Add(new VirtualStateMachine.VirtualChildStateMachine
             {
@@ -356,7 +403,7 @@ namespace WoodenNut.WNAE
                     StateMachine = sub,
                     Clip = clip,
                     WriteDefaults = state.WriteDefaultValues,
-                    Prefix = builder.ParameterPrefix + index++,
+                    Prefix = AllocatePrefix(builder.ParameterPrefix, reserved, ref index),
                 };
 
                 builder.Prepare(controller, ctx, behaviour);
@@ -377,7 +424,7 @@ namespace WoodenNut.WNAE
                 last = entry.Last;
             }
 
-            if (head == null) return;
+            if (head == null) return sub;
 
             // 出ていく遷移は終端へ移す。自己遷移が含まれていても、この後の張り替えで先頭に向く
             var outgoing = state.Transitions;
@@ -414,6 +461,60 @@ namespace WoodenNut.WNAE
             }
 
             parent.States = parent.States.RemoveAll(cs => cs.State == state);
+            return sub;
+        }
+
+        private static string AllocatePrefix(string prefix, HashSet<string> reserved, ref int index)
+        {
+            var suffixes = new[] { "/ta", "/tb", "/acc", "/t2", "/active" };
+            string candidate;
+            do { candidate = prefix + index++; }
+            while (suffixes.Any(s => reserved.Contains(candidate + s)));
+            foreach (var suffix in suffixes) reserved.Add(candidate + suffix);
+            return candidate;
+        }
+
+        /// <summary>
+        /// 自己遷移禁止の単位を Init ではなく、置換前の State 全体に保つ。
+        /// 1 レイヤーに 1 個のローカル Int を置き、各 State の進入時に所属を記録する。
+        /// 終端でも ID を保持し、外部 State への退出・AnyState 割り込み時には 0 / 別 ID に更新する。
+        /// </summary>
+        private static void GuardAnyStateReentry(
+            VirtualAnimatorController controller, VirtualStateMachine root,
+            List<VirtualStateMachine> expanded, HashSet<string> reserved, ref int index)
+        {
+            var groups = expanded.Where(s => s.DefaultState != null).ToList();
+            var heads = groups.Select((s, i) => (s.DefaultState, Id: i + 1))
+                .ToDictionary(p => p.DefaultState, p => p.Id);
+            var incoming = AllMachines(root).SelectMany(s => s.AnyStateTransitions)
+                .Where(t => t != null && !t.CanTransitionToSelf && t.DestinationState != null &&
+                            heads.ContainsKey(t.DestinationState)).ToList();
+            if (incoming.Count == 0) return;
+
+            var parameter = AllocatePrefix("WNAE/State/", reserved, ref index) + "/active";
+            WNAEAnimator.EnsureIntParameter(controller, parameter);
+            foreach (var transition in incoming)
+                transition.Conditions = transition.Conditions.Add(WNAEAnimator.Condition(
+                    AnimatorConditionMode.NotEqual, parameter, heads[transition.DestinationState]));
+
+            var membership = new Dictionary<VirtualState, int>();
+            for (var i = 0; i < groups.Count; i++)
+                foreach (var state in groups[i].AllStates()) membership[state] = i + 1;
+
+            foreach (var state in root.AllStates())
+            {
+                var driver = WNAEAnimator.CreateDriver("WNAE logical state", localOnly: false);
+                WNAEAnimator.AddSet(driver, parameter, membership.TryGetValue(state, out var id) ? id : 0);
+                state.Behaviours = state.Behaviours.Insert(0, driver);
+            }
+        }
+
+        private static IEnumerable<VirtualStateMachine> AllMachines(VirtualStateMachine root)
+        {
+            yield return root;
+            foreach (var child in root.StateMachines)
+                if (child.StateMachine != null)
+                    foreach (var nested in AllMachines(child.StateMachine)) yield return nested;
         }
 
         private static void Repoint(VirtualStateMachine stateMachine, VirtualState from, VirtualState to)
@@ -439,7 +540,7 @@ namespace WoodenNut.WNAE
 
         private static void Retarget(VirtualTransitionBase transition, VirtualState from, VirtualState to)
         {
-            if (transition.DestinationState == from) transition.SetDestination(to);
+            if (transition != null && transition.DestinationState == from) transition.SetDestination(to);
         }
 
         /// <summary>

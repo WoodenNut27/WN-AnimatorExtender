@@ -111,6 +111,14 @@ namespace WoodenNut.WNAE
                 return;
             }
 
+            if (!WNAEUtil.IsFinite(entry.minValue) || !WNAEUtil.IsFinite(entry.maxValue) ||
+                !WNAEUtil.IsFinite(item.DefaultValue))
+            {
+                item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
+                    "Range / Default に NaN や Infinity は指定できません。"));
+                return;
+            }
+
             if (!entry.overrideDefaultValue && item.Existing == null)
             {
                 item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Info,
@@ -139,6 +147,16 @@ namespace WoodenNut.WNAE
             }
 
             if (!item.Range.IsValid) return;
+
+            // 間隔が 0 でなくても、狭い Range では隣接段階や境界が同じ float に丸まる。
+            // 復号した各段階が自分自身へ再エンコードされることまで確認する。
+            if (item.Range.Step <= 0f || Enumerable.Range(0, item.Range.Levels)
+                    .Any(i => item.Range.IndexOf(item.Range.ValueOf(i)) != i))
+            {
+                item.Issues.Add(new WNAEIssue(WNAEIssueLevel.Error,
+                    "Range が狭すぎるため、指定した Bits で段階を表現できません。"));
+                return;
+            }
 
             if (entry.bits >= WarnBits)
             {
@@ -220,10 +238,9 @@ namespace WoodenNut.WNAE
         /// <summary>
         /// ローカルで Float を量子化し、同期 Bool 群へ書き出すレイヤー。
         ///
-        /// Float には Equals 条件が使えないため、上の段階から順に「Greater 下側境界」1 条件だけで振り分ける。
-        /// AnyState 遷移は宣言順で最初にマッチしたものが選ばれるので、これで隙間も重複も生じない。
-        /// 両側を Greater + Less で挟む方式だと、境界値ちょうどのときどちらにも入らない穴ができる
-        /// （VRChat の同期 Float は 8bit 量子化されているので境界に乗ることが実際に起こる）。
+        /// 下側 < value <= 上側という排他的な区間で振り分ける。
+        /// Less(nextFloat(上側)) は、float で表現できる値に対して <= 上側と等価。
+        /// 下限だけの優先順位判定では、自己遷移が除外された瞬間に下位段階へ落ちて発振する。
         /// </summary>
         private static void BuildEncodeLayer(
             VirtualAnimatorController controller,
@@ -259,11 +276,18 @@ namespace WoodenNut.WNAE
                     WNAEAnimator.Condition(AnimatorConditionMode.If, WNAEAnimator.IsLocalParameter, 0f),
                 };
 
-                // 最下段は受け皿なので Float の条件を付けない
+                // 最下段は下限を設けず、Range 未満の入力も受け止める
                 if (index > 0)
                 {
                     conditions.Add(WNAEAnimator.Condition(
                         AnimatorConditionMode.Greater, entry.name, item.Range.LowerThreshold(index)));
+                }
+
+                if (index < item.Range.Levels - 1)
+                {
+                    conditions.Add(WNAEAnimator.Condition(
+                        AnimatorConditionMode.Less, entry.name,
+                        WNAEUtil.NextFloatUp(item.Range.LowerThreshold(index + 1))));
                 }
 
                 transitions.Add(WNAEAnimator.CreateAnyStateTransition(state, conditions));
